@@ -3,7 +3,7 @@
 // @name            Island (notch)
 // @description     A click-only notch at the top of the screen: notifications, music with lyrics, timers, shelf, clipboard and notes
 // @version         0.1.0
-// @author          you
+// @author          Darren Nadarajah
 // @include         windhawk.exe
 // @compilerOptions -lgdi32 -luser32 -ld2d1 -ldwrite -lwindowscodecs -lole32 -loleaut32 -luuid -lshell32 -lshlwapi -lshcore -lwinhttp -lwbemuuid -ldwmapi -lwindowsapp -lversion
 // ==/WindhawkMod==
