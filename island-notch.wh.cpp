@@ -2,8 +2,9 @@
 // @id              island-notch
 // @name            Island (notch)
 // @description     A click-only notch at the top of the screen: notifications, music with lyrics, timers, activity, shelf, clipboard and notes
-// @version         0.5.0
+// @version         1.0.0
 // @author          Darren Nadarajah
+// @github          https://github.com/darrenn19
 // @include         windhawk.exe
 // @compilerOptions -lgdi32 -luser32 -ld2d1 -ldwrite -lwindowscodecs -lole32 -loleaut32 -luuid -lshell32 -lshlwapi -lshcore -lwinhttp -ldwmapi -lpsapi -lwindowsapp -lversion
 // ==/WindhawkMod==
@@ -12,32 +13,57 @@
 /*
 # Island
 
-A notch at the top centre of your main screen. Nothing opens on hover: **click** it.
+A notch at the top centre of your main screen, in the spirit of the Dynamic Island.
+Nothing opens on hover: **click** it.
+
+## Using it
 
 | Where | Left click | Right click |
 |---|---|---|
 | The bar | full view | half view |
-| Half view | full view on that item | close |
+| Half view | full view on that item (small buttons act in place) | close |
 | Full view | the buttons | half view |
-| A pop-up | Notifications tab | dismiss the pop-up |
+| A notification pop-up | Notifications tab | dismiss the pop-up |
 
+- Clicking outside the full view closes the island, unless you pin it (pin, top right).
+  The half view stays until you close it (right-click, Alt+Z or Esc).
 - **Alt+Z** steps closed → half → full → closed. **Alt+Shift+Z** locks it see-through.
+  **Esc** closes it.
 - **Hold Alt** to see (and click) through it. **Shake** the pointer over the half view to
-  toggle see-through; it comes back a quarter-second after you move away.
-- Full view tabs: Notifications, Music (with lyrics), Clock (timer, alarms, stopwatch),
-  Activity (downloads, file copies, apps using your microphone), Shelf (drop files on the
-  island), Clipboard, Notes.
-- The pin keeps the full view open when you click elsewhere. The half view always stays
-  until you close it (right-click, Alt+Z or Esc).
+  make it see-through; it comes back a quarter-second after you move away.
+- The half view shows what's running: music, timer, stopwatch, downloads, file copies,
+  apps using your microphone (with a mute button), and a notification count.
 
-Notes
+## Tabs
+
+- **Notifications**: everything Windows shows, with app icons. Click one to open its app.
+  Per-app rules (pop up / quiet / off) and Windows' Do not disturb are respected.
+- **Music**: whatever is playing (Spotify, a browser tab, Apple Music...): cover, controls,
+  seek bar, and lyrics (timed lyrics follow the song; click a line to jump there).
+  The source button brings the playing app or browser tab to the front.
+- **Clock**: timer (click the digits to type a time), alarms (add, remove, switch on/off),
+  stopwatch with laps.
+- **Activity**: downloads in your Downloads folder, File Explorer copies, apps using
+  your microphone.
+- **Shelf**: drop files on the island to keep them handy; drag them out or click to open.
+- **Clipboard**: your last 8 text copies; click one to copy it again.
+- **Notes**: a saved scratchpad with the usual shortcuts (Ctrl+A/C/X/V/Z/Y, Ctrl+arrows,
+  Ctrl+Backspace/Delete, Shift to select) and a **Line** button for a divider.
+
+## What it does on your PC
+
 - Runs in its own process (a Windhawk "tool mod"), so it can't take Explorer down.
-- Notifications are read from Windows' own notification database. Windows' own pop-ups are
-  turned off while the mod runs (setting), and restored when it stops.
-- Music apps don't give lyrics to Windows. When "Look up lyrics" is on, the song's title,
-  artist and length are sent to lrclib.net, which returns timed lyrics, plain lyrics or none.
-- The lock screen is off-limits to all apps; the verification animation plays for
-  Windows Security prompts on your desktop.
+- Reads new notifications from Windows' own notification database (read-only).
+- **Turns off Windows' own notification banners** while it runs (setting, on by default),
+  by setting each app's "Show notification banners" option. The previous values are saved
+  and put back when the mod stops or the setting is turned off.
+- **Looks up lyrics online**: music apps don't give lyrics to Windows, so the song's title,
+  artist and length are sent to [lrclib.net](https://lrclib.net). Turn off "Look up lyrics"
+  to stop this.
+- Watches keys and clicks system-wide (with standard Windows hooks) only to notice the
+  hold key, Esc and clicks outside the island. Nothing is recorded or sent anywhere.
+- The clipboard history skips anything password managers mark as private, and is not saved.
+- Topmost like any always-on-top window; Windows keeps Start and search above it.
 */
 // ==/WindhawkModReadme==
 
@@ -712,10 +738,21 @@ static bool HttpGet(const wstring& host, const std::string& pathUtf8, std::strin
 }
 
 static void AppendUtf8(std::string& s, unsigned cp) {
-    if (cp < 0x80) s += (char)cp;
-    else if (cp < 0x800) { s += (char)(0xC0 | (cp >> 6)); s += (char)(0x80 | (cp & 0x3F)); }
-    else if (cp < 0x10000) { s += (char)(0xE0 | (cp >> 12)); s += (char)(0x80 | ((cp >> 6) & 0x3F)); s += (char)(0x80 | (cp & 0x3F)); }
-    else { s += (char)(0xF0 | (cp >> 18)); s += (char)(0x80 | ((cp >> 12) & 0x3F)); s += (char)(0x80 | ((cp >> 6) & 0x3F)); s += (char)(0x80 | (cp & 0x3F)); }
+    if (cp < 0x80) {
+        s += (char)cp;
+    } else if (cp < 0x800) {
+        s += (char)(0xC0 | (cp >> 6));
+        s += (char)(0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+        s += (char)(0xE0 | (cp >> 12));
+        s += (char)(0x80 | ((cp >> 6) & 0x3F));
+        s += (char)(0x80 | (cp & 0x3F));
+    } else {
+        s += (char)(0xF0 | (cp >> 18));
+        s += (char)(0x80 | ((cp >> 12) & 0x3F));
+        s += (char)(0x80 | ((cp >> 6) & 0x3F));
+        s += (char)(0x80 | (cp & 0x3F));
+    }
 }
 
 // Read the JSON string value of "key" (first occurrence). Returns false for null/missing/empty.
@@ -4393,18 +4430,8 @@ static void UiThread() {
     wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512) /* IDC_ARROW */);
     wc.lpszClassName = L"IslandNotchWindow";
     RegisterClassExW(&wc);
-    // Windows keeps Start, search and the notification centre in "bands" above every normal
-    // topmost window. Ask for a higher band first; Windows only grants that to some processes
-    // (e.g. ones with UI Access), so fall back to plain topmost if it says no.
-    using CreateWindowInBand_t = HWND(WINAPI*)(DWORD, LPCWSTR, LPCWSTR, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE, LPVOID, DWORD);
-    auto createInBand = (CreateWindowInBand_t)GetProcAddress(GetModuleHandleW(L"user32.dll"), "CreateWindowInBand");
     const DWORD EX = WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE;
-    for (DWORD band : {16u /* system tools */, 2u /* UI access */, 7u /* edgy */}) {
-        if (!createInBand) break;
-        g_hwnd = createInBand(EX, wc.lpszClassName, L"Island", WS_POPUP, 0, 0, 10, 10, nullptr, nullptr, wc.hInstance, nullptr, band);
-        if (g_hwnd) { Wh_Log(L"Window band %u granted: above Start", band); break; }
-    }
-    if (!g_hwnd) g_hwnd = CreateWindowExW(EX, wc.lpszClassName, L"Island", WS_POPUP, 0, 0, 10, 10, nullptr, nullptr, wc.hInstance, nullptr);
+    g_hwnd = CreateWindowExW(EX, wc.lpszClassName, L"Island", WS_POPUP, 0, 0, 10, 10, nullptr, nullptr, wc.hInstance, nullptr);
     if (!g_hwnd) {
         Wh_Log(L"CreateWindowEx failed: %u", GetLastError());
         ShutdownGraphics();
@@ -4452,17 +4479,17 @@ static void UiThread() {
     OleUninitialize();
 }
 
-static bool WhTool_ModInit() {
+BOOL WhTool_ModInit() {
     LoadSettings();
     g_uiThread = std::thread(UiThread);
     return true;
 }
 
-static void WhTool_ModSettingsChanged() {
+void WhTool_ModSettingsChanged() {
     if (g_hwnd) PostMessageW(g_hwnd, WM_ISLAND_SETTINGS, 0, 0);
 }
 
-static void WhTool_ModUninit() {
+void WhTool_ModUninit() {
     HWND h = g_hwnd;
     if (h) PostMessageW(h, WM_CLOSE, 0, 0);
     if (g_uiThread.joinable()) g_uiThread.join();
