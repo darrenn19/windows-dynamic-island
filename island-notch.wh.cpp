@@ -1,11 +1,11 @@
 // ==WindhawkMod==
 // @id              island-notch
 // @name            Island (notch)
-// @description     A click-only notch at the top of the screen: notifications, music with lyrics, timers, shelf, clipboard and notes
-// @version         0.1.0
+// @description     A click-only notch at the top of the screen: notifications, music with lyrics, timers, activity, shelf, clipboard and notes
+// @version         0.5.0
 // @author          Darren Nadarajah
 // @include         windhawk.exe
-// @compilerOptions -lgdi32 -luser32 -ld2d1 -ldwrite -lwindowscodecs -lole32 -loleaut32 -luuid -lshell32 -lshlwapi -lshcore -lwinhttp -lwbemuuid -ldwmapi -lwindowsapp -lversion
+// @compilerOptions -lgdi32 -luser32 -ld2d1 -ldwrite -lwindowscodecs -lole32 -loleaut32 -luuid -lshell32 -lshlwapi -lshcore -lwinhttp -ldwmapi -lpsapi -lwindowsapp -lversion
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
@@ -25,12 +25,15 @@ A notch at the top centre of your main screen. Nothing opens on hover: **click**
 - **Hold Alt** to see (and click) through it. **Shake** the pointer over the half view to
   toggle see-through; it comes back a quarter-second after you move away.
 - Full view tabs: Notifications, Music (with lyrics), Clock (timer, alarms, stopwatch),
-  Shelf (drop files on the island), Clipboard, Notes.
+  Activity (downloads, file copies, apps using your microphone), Shelf (drop files on the
+  island), Clipboard, Notes.
+- The pin keeps the full view open when you click elsewhere. The half view always stays
+  until you close it (right-click, Alt+Z or Esc).
 
 Notes
 - Runs in its own process (a Windhawk "tool mod"), so it can't take Explorer down.
-- Notifications are read from Windows' own notification database; Windows still shows its
-  pop-ups too (turn banners off per app in Windows Settings if you only want the island's).
+- Notifications are read from Windows' own notification database. Windows' own pop-ups are
+  turned off while the mod runs (setting), and restored when it stops.
 - Music apps don't give lyrics to Windows. When "Look up lyrics" is on, the song's title,
   artist and length are sent to lrclib.net, which returns timed lyrics, plain lyrics or none.
 - The lock screen is off-limits to all apps; the verification animation plays for
@@ -47,10 +50,11 @@ Notes
   - hidden: Hide it (click the top centre to open)
 - popups: true
   $name: Show new notifications as pop-ups
-- levelPopup: true
-  $name: Show volume and brightness changes
+- hideBanners: true
+  $name: Hide Windows' own notification pop-ups
+  $description: While the island runs, Windows' banners are turned off for every app (they still reach the notification centre). Turned back on when the mod stops.
 - autoHalf: true
-  $name: Open the half view when a timer starts
+  $name: Open the half view when something starts (timer, download, file copy, call)
 - lyrics: true
   $name: Look up lyrics (lrclib.net)
 - verifyAnimation: true
@@ -87,14 +91,6 @@ Notes
   - Clock
   - Alarms
   $name: Apps allowed during Do not disturb (part of their name)
-- alarms:
-  - - time: "07:00"
-      $name: Time (HH:MM, 24-hour)
-    - label: Wake up
-      $name: Label
-    - enabled: true
-      $name: On
-  $name: Alarms
 */
 // ==/WindhawkModSettings==
 
@@ -118,8 +114,10 @@ Notes
 #include <mmdeviceapi.h>
 #include <endpointvolume.h>
 #include <winhttp.h>
-#include <wbemidl.h>
+#include <audiopolicy.h>
+#include <psapi.h>
 #include <oleidl.h>
+#include <uiautomation.h>
 
 #undef GetCurrentTime  // clashes with C++/WinRT
 #include <winrt/base.h>
@@ -257,7 +255,7 @@ struct AlarmCfg {
 struct Settings {
     bool idleHidden = false;
     bool popups = true;
-    bool levelPopup = true;
+    bool hideBanners = true;
     bool autoHalf = true;
     bool lyrics = true;
     bool verifyAnimation = true;
@@ -268,7 +266,6 @@ struct Settings {
     double radius = 20;
     std::vector<Rule> rules;
     std::vector<wstring> dndAllow;
-    std::vector<AlarmCfg> alarms;
 } g_set;
 
 static wstring GetStr(PCWSTR name) {
@@ -282,7 +279,7 @@ static void LoadSettings() {
     Settings s;
     s.idleHidden = GetStr(L"idleStyle") == L"hidden";
     s.popups = Wh_GetIntSetting(L"popups") != 0;
-    s.levelPopup = Wh_GetIntSetting(L"levelPopup") != 0;
+    s.hideBanners = Wh_GetIntSetting(L"hideBanners") != 0;
     s.autoHalf = Wh_GetIntSetting(L"autoHalf") != 0;
     s.lyrics = Wh_GetIntSetting(L"lyrics") != 0;
     s.verifyAnimation = Wh_GetIntSetting(L"verifyAnimation") != 0;
@@ -318,24 +315,6 @@ static void LoadSettings() {
         Wh_FreeStringSetting(app);
         if (!a.empty()) s.dndAllow.push_back(ToLower(a));
     }
-    for (int i = 0; i < 32; i++) {
-        wchar_t n[64];
-        swprintf_s(n, L"alarms[%d].time", i);
-        PCWSTR t = Wh_GetStringSetting(n);
-        if (!t) break;
-        wstring ts = t;
-        Wh_FreeStringSetting(t);
-        int hh = -1, mm = -1;
-        if (swscanf_s(ts.c_str(), L"%d:%d", &hh, &mm) != 2 || hh < 0 || hh > 23 || mm < 0 || mm > 59) continue;
-        AlarmCfg a;
-        a.hour = hh;
-        a.minute = mm;
-        swprintf_s(n, L"alarms[%d].label", i);
-        a.label = GetStr(n);
-        swprintf_s(n, L"alarms[%d].enabled", i);
-        a.enabled = Wh_GetIntSetting(n) != 0;
-        s.alarms.push_back(a);
-    }
     g_set = std::move(s);
 }
 
@@ -367,8 +346,6 @@ static void SaveValue(PCWSTR key, const wstring& v) { Wh_SetStringValue(key, v.c
 
 #define WM_ISLAND_NOTIF (WM_APP + 1)   // new notifications are waiting in g_incoming
 #define WM_ISLAND_MEDIA (WM_APP + 2)   // media state changed
-#define WM_ISLAND_LEVEL (WM_APP + 3)   // wParam 0 volume, 1 brightness; lParam level | muted << 16
-#define WM_ISLAND_REBIND (WM_APP + 4)  // default audio device changed
 
 static HWND g_hwnd = nullptr;
 static std::atomic<bool> g_stop{false};
@@ -852,12 +829,111 @@ static std::mutex g_cmdMx;
 static std::vector<MediaCommand> g_cmds;
 static HANDLE g_mediaWake = nullptr;
 
+static double g_seekHoldUntil = 0;
+static long long g_seekTarget = 0;
+static double g_playHoldUntil = 0;  // after play/pause, trust our state until the app agrees
+static bool g_playTarget = false;
+
 static void SendMediaCommand(MediaCmd c, long long ms = 0) {
+    if (c == MediaCmd::PlayPause || c == MediaCmd::Next || c == MediaCmd::Prev) {  // show it at once
+        std::lock_guard<std::mutex> lk(g_mx);
+        double t = QpcSeconds();
+        if (c == MediaCmd::PlayPause) {
+            if (g_media.playing) g_media.posMs += (long long)((t - g_media.sampledAt) * 1000);
+            g_media.playing = !g_media.playing;
+            g_playTarget = g_media.playing;
+            g_playHoldUntil = t + 1.2;
+        } else {
+            g_media.posMs = 0;
+        }
+        g_media.sampledAt = t;
+        PostToUi(WM_ISLAND_MEDIA);
+    }
+    if (c == MediaCmd::Seek) {  // show the new spot at once (the app reports it a moment later)
+        std::lock_guard<std::mutex> lk(g_mx);
+        g_media.posMs = ms;
+        g_media.sampledAt = QpcSeconds();
+        g_seekTarget = ms;
+        g_seekHoldUntil = QpcSeconds() + 1.5;
+    }
     {
         std::lock_guard<std::mutex> lk(g_cmdMx);
         g_cmds.push_back({c, ms});
     }
     if (g_mediaWake) SetEvent(g_mediaWake);
+}
+
+// The exe name without ".exe", lower-case.
+static wstring ProcessStem(DWORD pid) {
+    wstring r;
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return r;
+    wchar_t path[MAX_PATH];
+    DWORD n = MAX_PATH;
+    if (QueryFullProcessImageNameW(h, 0, path, &n)) {
+        r = ToLower(PathFindFileNameW(path));
+        if (r.size() > 4 && r.substr(r.size() - 4) == L".exe") r.resize(r.size() - 4);
+    }
+    CloseHandle(h);
+    return r;
+}
+// Does this process belong to the app with this AUMID? ("Spotify.exe", "MSEdge", "Chrome._crx_…", "AppleInc.AppleMusicWin_…")
+static bool StemMatchesAumid(const wstring& stem, const wstring& aumid) {
+    if (stem.size() < 3) return false;
+    wstring a = ToLower(aumid);
+    return a.find(stem) != wstring::npos;
+}
+
+// Fade the playing app's own volume (its audio session) down, jump, and fade back up,
+// so a seek doesn't cut in with a click. The user's volume setting is restored exactly.
+static void FadeSessions(const wstring& aumid, bool down, std::vector<std::pair<ISimpleAudioVolume*, float>>& vols) {
+    if (down) {
+        IMMDeviceEnumerator* en = nullptr;
+        IMMDevice* dev = nullptr;
+        IAudioSessionManager2* mgr = nullptr;
+        IAudioSessionEnumerator* list = nullptr;
+        if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&en))) &&
+            SUCCEEDED(en->GetDefaultAudioEndpoint(eRender, eMultimedia, &dev)) &&
+            SUCCEEDED(dev->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL, nullptr, (void**)&mgr)) && SUCCEEDED(mgr->GetSessionEnumerator(&list))) {
+            int n = 0;
+            list->GetCount(&n);
+            for (int i = 0; i < n; i++) {
+                IAudioSessionControl* c = nullptr;
+                IAudioSessionControl2* c2 = nullptr;
+                if (FAILED(list->GetSession(i, &c))) continue;
+                DWORD pid = 0;
+                AudioSessionState st = AudioSessionStateInactive;
+                c->GetState(&st);
+                if (st == AudioSessionStateActive && SUCCEEDED(c->QueryInterface(IID_PPV_ARGS(&c2))) && SUCCEEDED(c2->GetProcessId(&pid)) &&
+                    StemMatchesAumid(ProcessStem(pid), aumid)) {
+                    ISimpleAudioVolume* v = nullptr;
+                    float lvl = 1;
+                    if (SUCCEEDED(c->QueryInterface(IID_PPV_ARGS(&v))) && SUCCEEDED(v->GetMasterVolume(&lvl))) vols.push_back({v, lvl});
+                    else SafeRelease(v);
+                }
+                SafeRelease(c2);
+                SafeRelease(c);
+            }
+        }
+        SafeRelease(list);
+        SafeRelease(mgr);
+        SafeRelease(dev);
+        SafeRelease(en);
+    }
+    const int steps = down ? 5 : 9;
+    for (int k = 1; k <= steps; k++) {
+        float f = (float)k / steps;
+        f = f * f * (3 - 2 * f);
+        for (auto& [v, lvl] : vols) v->SetMasterVolume(lvl * (down ? 1 - f : f), nullptr);
+        Sleep(16);
+    }
+    if (!down) {
+        for (auto& [v, lvl] : vols) {
+            v->SetMasterVolume(lvl, nullptr);
+            v->Release();
+        }
+        vols.clear();
+    }
 }
 
 static Pixels DecodeArt(IStream* stm) {
@@ -889,8 +965,16 @@ static Pixels DecodeArt(IStream* stm) {
     return px;
 }
 
+static unsigned long long PixelsHash(const Pixels& p) {
+    unsigned long long h = 1469598103934665603ULL;
+    for (size_t i = 0; i < p.data.size(); i += 7) h = (h ^ p.data[i]) * 1099511628211ULL;
+    return h;
+}
+
 static void MediaThread() {
     using namespace winrt::Windows::Media::Control;
+    int artChecks = 0, pollCount = 0;
+    unsigned long long artHash = 0;
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
     GlobalSystemMediaTransportControlsSessionManager mgr{nullptr};
     wstring lastKey;
@@ -904,14 +988,31 @@ static void MediaThread() {
                 std::lock_guard<std::mutex> lk(g_cmdMx);
                 cmds.swap(g_cmds);
             }
+            // Only the last seek of a burst matters (dragging or scrolling sends many).
+            for (size_t i = 0; i + 1 < cmds.size(); i++)
+                if (cmds[i].cmd == MediaCmd::Seek)
+                    for (size_t j = i + 1; j < cmds.size(); j++)
+                        if (cmds[j].cmd == MediaCmd::Seek) { cmds[i].cmd = MediaCmd(-1); break; }
             if (s) {
                 for (auto& c : cmds) {
-                    if (c.cmd == MediaCmd::PlayPause) s.TryTogglePlayPauseAsync().get();
-                    else if (c.cmd == MediaCmd::Next) s.TrySkipNextAsync().get();
-                    else if (c.cmd == MediaCmd::Prev) s.TrySkipPreviousAsync().get();
-                    else if (c.cmd == MediaCmd::Seek) s.TryChangePlaybackPositionAsync(c.ms * 10000).get();
+                    // Fire and forget: waiting for the app's reply is what made the buttons feel slow.
+                    if (c.cmd == MediaCmd::PlayPause) s.TryTogglePlayPauseAsync();
+                    else if (c.cmd == MediaCmd::Next) s.TrySkipNextAsync();
+                    else if (c.cmd == MediaCmd::Prev) s.TrySkipPreviousAsync();
+                    else if (c.cmd == MediaCmd::Seek) {
+                        std::vector<std::pair<ISimpleAudioVolume*, float>> vols;
+                        wstring src = s.SourceAppUserModelId().c_str();
+                        FadeSessions(src, true, vols);
+                        try {
+                            s.TryChangePlaybackPositionAsync(c.ms * 10000).get();
+                        } catch (...) {
+                        }
+                        Sleep(60);
+                        FadeSessions(src, false, vols);  // always restores the app's volume, even if the seek failed
+                    }
                 }
             }
+            if (!cmds.empty()) Sleep(120);  // give the app a moment, then read the new state
             Media m;
             if (s) {
                 auto props = s.TryGetMediaPropertiesAsync().get();
@@ -936,9 +1037,18 @@ static void MediaThread() {
                 if (m.title.empty()) m.has = false;
 
                 wstring key = m.title + L"\x1f" + m.artist + L"\x1f" + m.aumid;
-                if (m.has && key != lastKey) {
+                bool newTrack = m.has && key != lastKey;
+                if (newTrack) {
                     lastKey = key;
                     ResolveApp(m.aumid);
+                    artChecks = 8;  // read the cover now and on the next few polls (~3 s)
+                    artHash = 0;
+                    std::lock_guard<std::mutex> lk(g_mx);
+                    g_media.art = Pixels{};  // no stale cover while the new one loads
+                    g_media.artGen++;
+                }
+                if (m.has && (artChecks > 0 || ++pollCount % 8 == 0)) {
+                    if (artChecks > 0) artChecks--;
                     Pixels art;
                     try {
                         if (auto th = props.Thumbnail()) {
@@ -954,11 +1064,19 @@ static void MediaThread() {
                         }
                     } catch (...) {
                     }
-                    unsigned gen;
-                    {
+                    unsigned long long hsh = PixelsHash(art);
+                    if (!art.data.empty() && hsh != artHash) {
+                        artHash = hsh;
                         std::lock_guard<std::mutex> lk(g_mx);
                         g_media.art = std::move(art);
                         g_media.artGen++;
+                        PostToUi(WM_ISLAND_MEDIA);
+                    }
+                }
+                if (newTrack) {
+                    unsigned gen;
+                    {
+                        std::lock_guard<std::mutex> lk(g_mx);
                         g_media.lyrics.clear();
                         g_media.lyrState = g_set.lyrics ? 0 : 4;
                         gen = ++g_media.lyrGen;
@@ -976,6 +1094,17 @@ static void MediaThread() {
                 std::lock_guard<std::mutex> lk(g_mx);
                 bool changed = g_media.has != m.has || g_media.title != m.title || g_media.playing != m.playing ||
                                std::llabs(g_media.posMs - m.posMs) > 1500 || g_media.durMs != m.durMs;
+                // Right after play/pause the app may still report the old state; keep ours until it agrees.
+                if (QpcSeconds() < g_playHoldUntil && m.title == g_media.title && m.playing != g_playTarget) {
+                    m.playing = g_playTarget;
+                    m.posMs = g_media.posMs + (g_media.playing ? (long long)((QpcSeconds() - g_media.sampledAt) * 1000) : 0);
+                } else if (m.playing == g_playTarget) {
+                    g_playHoldUntil = 0;
+                }
+                // Right after a seek the app may still report the old spot; keep ours until it catches up.
+                if (QpcSeconds() < g_seekHoldUntil && std::llabs(m.posMs - g_seekTarget) > 2500) {
+                    m.posMs = g_media.posMs + (g_media.playing ? (long long)((QpcSeconds() - g_media.sampledAt) * 1000) : 0);
+                }
                 Pixels art = std::move(g_media.art);
                 auto lyr = std::move(g_media.lyrics);
                 int ls = g_media.lyrState;
@@ -993,204 +1122,345 @@ static void MediaThread() {
         } catch (...) {
             mgr = nullptr;
         }
-        WaitForSingleObject(g_mediaWake, 700);
+        WaitForSingleObject(g_mediaWake, artChecks > 0 || QpcSeconds() < g_playHoldUntil ? 350 : 700);
     }
     (void)lyrGen;
     winrt::uninit_apartment();
 }
 
 // ============================================================================
-// Volume (master endpoint) and brightness (WMI events)
+// Microphone: who's using it (Windows' privacy records) and the system mute
 // ============================================================================
 
-class VolumeCallback : public IAudioEndpointVolumeCallback {
-    LONG ref = 1;
-
-   public:
-    virtual ~VolumeCallback() = default;
-    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&ref); }
-    ULONG STDMETHODCALLTYPE Release() override {
-        LONG r = InterlockedDecrement(&ref);
-        if (!r) delete this;
-        return r;
-    }
-    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** pp) override {
-        if (iid == IID_IUnknown || iid == __uuidof(IAudioEndpointVolumeCallback)) {
-            *pp = static_cast<IAudioEndpointVolumeCallback*>(this);
-            AddRef();
-            return S_OK;
-        }
-        *pp = nullptr;
-        return E_NOINTERFACE;
-    }
-    HRESULT STDMETHODCALLTYPE OnNotify(PAUDIO_VOLUME_NOTIFICATION_DATA d) override {
-        int lvl = (int)std::lround(d->fMasterVolume * 100);
-        PostToUi(WM_ISLAND_LEVEL, 0, lvl | (d->bMuted ? 1 << 16 : 0));
-        return S_OK;
-    }
+struct MicUser {
+    wstring name, key;  // display name, registry key name
+    ULONGLONG start;    // FILETIME of when it started
 };
 
-class DeviceCallback : public IMMNotificationClient {
-    LONG ref = 1;
-
-   public:
-    virtual ~DeviceCallback() = default;
-    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&ref); }
-    ULONG STDMETHODCALLTYPE Release() override {
-        LONG r = InterlockedDecrement(&ref);
-        if (!r) delete this;
-        return r;
+static wstring NameFromConsentKey(const wstring& key) {
+    wstring s = key;
+    size_t p = s.find_last_of(L'#');  // non-packaged: "C:#Program Files#…#Teams.exe"
+    if (p != wstring::npos) s = s.substr(p + 1);
+    else {  // packaged: "MSTeams_8wekyb3d8bbwe"
+        p = s.find(L'_');
+        if (p != wstring::npos) s = s.substr(0, p);
+        p = s.find_last_of(L'.');
+        if (p != wstring::npos) s = s.substr(p + 1);
     }
-    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** pp) override {
-        if (iid == IID_IUnknown || iid == __uuidof(IMMNotificationClient)) {
-            *pp = static_cast<IMMNotificationClient*>(this);
-            AddRef();
-            return S_OK;
-        }
-        *pp = nullptr;
-        return E_NOINTERFACE;
-    }
-    HRESULT STDMETHODCALLTYPE OnDefaultDeviceChanged(EDataFlow flow, ERole role, LPCWSTR) override {
-        if (flow == eRender && role == eConsole) PostToUi(WM_ISLAND_REBIND);
-        return S_OK;
-    }
-    HRESULT STDMETHODCALLTYPE OnDeviceStateChanged(LPCWSTR, DWORD) override { return S_OK; }
-    HRESULT STDMETHODCALLTYPE OnDeviceAdded(LPCWSTR) override { return S_OK; }
-    HRESULT STDMETHODCALLTYPE OnDeviceRemoved(LPCWSTR) override { return S_OK; }
-    HRESULT STDMETHODCALLTYPE OnPropertyValueChanged(LPCWSTR, const PROPERTYKEY) override { return S_OK; }
-};
-
-static IMMDeviceEnumerator* g_devEnum = nullptr;
-static IAudioEndpointVolume* g_epVol = nullptr;
-static VolumeCallback* g_volCb = nullptr;
-static DeviceCallback* g_devCb = nullptr;
-
-static void UnbindVolume() {
-    if (g_epVol && g_volCb) g_epVol->UnregisterControlChangeNotify(g_volCb);
-    SafeRelease(g_epVol);
+    if (s.size() > 4 && ToLower(s.substr(s.size() - 4)) == L".exe") s.resize(s.size() - 4);
+    if (!s.empty()) s[0] = (wchar_t)towupper(s[0]);
+    return s;
 }
 
-static void BindVolume() {  // UI thread (COM initialised there)
-    UnbindVolume();
-    if (!g_devEnum) {
-        if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&g_devEnum)))) return;
-        g_devCb = new DeviceCallback();
-        g_devEnum->RegisterEndpointNotificationCallback(g_devCb);
-    }
-    IMMDevice* dev = nullptr;
-    if (SUCCEEDED(g_devEnum->GetDefaultAudioEndpoint(eRender, eConsole, &dev))) {
-        dev->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr, (void**)&g_epVol);
-        dev->Release();
-    }
-    if (g_epVol) {
-        if (!g_volCb) g_volCb = new VolumeCallback();
-        g_epVol->RegisterControlChangeNotify(g_volCb);
-    }
-}
-
-static void ShutdownVolume() {
-    UnbindVolume();
-    if (g_devEnum && g_devCb) g_devEnum->UnregisterEndpointNotificationCallback(g_devCb);
-    SafeRelease(g_devEnum);
-    if (g_volCb) { g_volCb->Release(); g_volCb = nullptr; }
-    if (g_devCb) { g_devCb->Release(); g_devCb = nullptr; }
-}
-
-static int GetVolume(bool* muted) {
-    float f = 0;
-    BOOL m = FALSE;
-    if (g_epVol) {
-        g_epVol->GetMasterVolumeLevelScalar(&f);
-        g_epVol->GetMute(&m);
-    }
-    if (muted) *muted = m;
-    return (int)std::lround(f * 100);
-}
-static void SetVolume(int v) {
-    if (g_epVol) g_epVol->SetMasterVolumeLevelScalar(std::clamp(v, 0, 100) / 100.0f, nullptr);
-}
-
-static void BrightnessThread() {
-    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    IWbemLocator* loc = nullptr;
-    IWbemServices* svc = nullptr;
-    IEnumWbemClassObject* en = nullptr;
-    if (SUCCEEDED(CoCreateInstance(CLSID_WbemLocator, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&loc)))) {
-        BSTR ns = SysAllocString(L"ROOT\\WMI");
-        if (SUCCEEDED(loc->ConnectServer(ns, nullptr, nullptr, nullptr, 0, nullptr, nullptr, &svc))) {
-            CoSetProxyBlanket(svc, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, nullptr, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE, nullptr,
-                              EOAC_NONE);
-            BSTR lang = SysAllocString(L"WQL");
-            BSTR q = SysAllocString(L"SELECT * FROM WmiMonitorBrightnessEvent");
-            if (FAILED(svc->ExecNotificationQuery(lang, q, WBEM_FLAG_RETURN_IMMEDIATELY | WBEM_FLAG_FORWARD_ONLY, nullptr, &en))) en = nullptr;
-            SysFreeString(lang);
-            SysFreeString(q);
-        }
-        SysFreeString(ns);
-    }
-    while (en && !g_stop) {
-        IWbemClassObject* obj = nullptr;
-        ULONG got = 0;
-        HRESULT hr = en->Next(500, 1, &obj, &got);
-        if (hr == WBEM_S_TIMEDOUT) continue;
-        if (FAILED(hr)) break;
-        if (got && obj) {
-            VARIANT v;
-            VariantInit(&v);
-            if (SUCCEEDED(obj->Get(L"Brightness", 0, &v, nullptr, nullptr)) && (v.vt == VT_UI1 || v.vt == VT_I4)) {
-                int b = v.vt == VT_UI1 ? v.bVal : v.lVal;
-                PostToUi(WM_ISLAND_LEVEL, 1, std::clamp(b, 0, 100));
-            }
-            VariantClear(&v);
-            obj->Release();
-        }
-    }
-    SafeRelease(en);
-    SafeRelease(svc);
-    SafeRelease(loc);
-    CoUninitialize();
-}
-
-// ============================================================================
-// Microphone / camera in use (Windows' privacy "in use" records)
-// ============================================================================
-
-static bool CapabilityInUse(const wchar_t* cap) {
+static std::vector<MicUser> CapabilityUsers(const wchar_t* cap) {
+    std::vector<MicUser> out;
     wstring base = wstring(L"Software\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore\\") + cap;
-    std::function<bool(const wstring&, int)> scan = [&](const wstring& path, int depth) -> bool {
+    std::function<void(const wstring&, const wstring&, int)> scan = [&](const wstring& path, const wstring& name, int depth) {
         HKEY k;
-        if (RegOpenKeyExW(HKEY_CURRENT_USER, path.c_str(), 0, KEY_READ, &k) != ERROR_SUCCESS) return false;
-        bool inUse = false;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, path.c_str(), 0, KEY_READ, &k) != ERROR_SUCCESS) return;
         ULONGLONG start = 0, stop = 0;
         DWORD sz = sizeof(start);
-        if (RegQueryValueExW(k, L"LastUsedTimeStart", nullptr, nullptr, (BYTE*)&start, &sz) == ERROR_SUCCESS) {
+        if (depth > 0 && RegQueryValueExW(k, L"LastUsedTimeStart", nullptr, nullptr, (BYTE*)&start, &sz) == ERROR_SUCCESS) {
             sz = sizeof(stop);
-            if (RegQueryValueExW(k, L"LastUsedTimeStop", nullptr, nullptr, (BYTE*)&stop, &sz) == ERROR_SUCCESS && start && !stop) inUse = true;
+            if (RegQueryValueExW(k, L"LastUsedTimeStop", nullptr, nullptr, (BYTE*)&stop, &sz) == ERROR_SUCCESS && start && !stop)
+                out.push_back({NameFromConsentKey(name), name, start});
         }
-        if (!inUse && depth < 2) {
-            wchar_t name[512];
+        if (depth < 2) {
+            wchar_t sub[512];
             for (DWORD i = 0;; i++) {
                 DWORD n = 512;
-                if (RegEnumKeyExW(k, i, name, &n, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) break;
-                if (scan(path + L"\\" + name, depth + 1)) { inUse = true; break; }
+                if (RegEnumKeyExW(k, i, sub, &n, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) break;
+                if (depth == 0 || wcscmp(name.c_str(), L"NonPackaged") == 0) scan(path + L"\\" + sub, sub, depth + 1);
             }
         }
         RegCloseKey(k);
-        return inUse;
     };
-    return scan(base, 0);
+    scan(base, L"", 0);
+    return out;
+}
+
+static IAudioEndpointVolume* MicEndpoint() {
+    IMMDeviceEnumerator* en = nullptr;
+    IMMDevice* dev = nullptr;
+    IAudioEndpointVolume* v = nullptr;
+    if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&en))) &&
+        SUCCEEDED(en->GetDefaultAudioEndpoint(eCapture, eCommunications, &dev)))
+        dev->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr, (void**)&v);
+    SafeRelease(dev);
+    SafeRelease(en);
+    return v;
+}
+static bool MicMuted() {
+    BOOL m = FALSE;
+    if (IAudioEndpointVolume* v = MicEndpoint()) { v->GetMute(&m); v->Release(); }
+    return m;
+}
+static void SetMicMuted(bool mute) {
+    if (IAudioEndpointVolume* v = MicEndpoint()) { v->SetMute(mute, nullptr); v->Release(); }
+}
+
+// ============================================================================
+// Windows' own notification banners: off while the island runs, restored after
+// (HKCU\...\Notifications\Settings\<app>\ShowBanner; a backup survives crashes)
+// ============================================================================
+
+static const wchar_t* NOTIF_SETTINGS = L"Software\\Microsoft\\Windows\\CurrentVersion\\Notifications\\Settings";
+static std::map<wstring, wstring> g_bannerBackup;  // app -> original value ("-" = wasn't set)
+
+static void SaveBannerBackup() {
+    wstring s;
+    for (auto& [k, v] : g_bannerBackup) s += k + L"\t" + v + L"\n";
+    SaveValue(L"bannerBackup", s);
+}
+static void LoadBannerBackup() {
+    g_bannerBackup.clear();
+    wstring s = LoadValue(L"bannerBackup");
+    size_t a = 0;
+    while (a < s.size()) {
+        size_t e = s.find(L'\n', a);
+        wstring line = s.substr(a, e == wstring::npos ? wstring::npos : e - a);
+        size_t t = line.find(L'\t');
+        if (t != wstring::npos) g_bannerBackup[line.substr(0, t)] = line.substr(t + 1);
+        if (e == wstring::npos) break;
+        a = e + 1;
+    }
+}
+static void HideBannerFor(const wstring& app) {
+    if (app.empty() || g_bannerBackup.count(app)) return;
+    HKEY k;
+    wstring path = wstring(NOTIF_SETTINGS) + L"\\" + app;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, path.c_str(), 0, nullptr, 0, KEY_READ | KEY_WRITE, nullptr, &k, nullptr) != ERROR_SUCCESS) return;
+    DWORD v = 0, sz = sizeof(v), type = 0;
+    bool had = RegQueryValueExW(k, L"ShowBanner", nullptr, &type, (BYTE*)&v, &sz) == ERROR_SUCCESS && type == REG_DWORD;
+    g_bannerBackup[app] = had ? std::to_wstring(v) : L"-";
+    DWORD zero = 0;
+    RegSetValueExW(k, L"ShowBanner", 0, REG_DWORD, (const BYTE*)&zero, sizeof(zero));
+    RegCloseKey(k);
+}
+static void HideAllBanners() {
+    LoadBannerBackup();  // keep originals from an earlier run that didn't get to restore
+    HKEY k;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, NOTIF_SETTINGS, 0, KEY_READ, &k) == ERROR_SUCCESS) {
+        wchar_t sub[512];
+        std::vector<wstring> apps;
+        for (DWORD i = 0;; i++) {
+            DWORD n = 512;
+            if (RegEnumKeyExW(k, i, sub, &n, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) break;
+            apps.push_back(sub);
+        }
+        RegCloseKey(k);
+        for (auto& a : apps) HideBannerFor(a);
+    }
+    SaveBannerBackup();
+}
+static void RestoreBanners() {
+    if (g_bannerBackup.empty()) LoadBannerBackup();
+    for (auto& [app, val] : g_bannerBackup) {
+        HKEY k;
+        wstring path = wstring(NOTIF_SETTINGS) + L"\\" + app;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, path.c_str(), 0, KEY_WRITE, &k) != ERROR_SUCCESS) continue;
+        if (val == L"-") RegDeleteValueW(k, L"ShowBanner");
+        else {
+            DWORD v = (DWORD)_wtoi(val.c_str());
+            RegSetValueExW(k, L"ShowBanner", 0, REG_DWORD, (const BYTE*)&v, sizeof(v));
+        }
+        RegCloseKey(k);
+    }
+    g_bannerBackup.clear();
+    SaveValue(L"bannerBackup", L"");
+}
+
+// ============================================================================
+// Bringing an app's window to the front (music source, notifications, calls)
+// ============================================================================
+
+static wstring WindowAumid(HWND w) {
+    static const PROPERTYKEY PK_AUMID = {{0x9F4C2855, 0x9F79, 0x4B39, {0xA8, 0xD0, 0xE1, 0xD4, 0x2D, 0xE1, 0xD5, 0xF3}}, 5};
+    wstring r;
+    IPropertyStore* ps = nullptr;
+    if (SUCCEEDED(SHGetPropertyStoreForWindow(w, IID_PPV_ARGS(&ps)))) {
+        PROPVARIANT pv;
+        PropVariantInit(&pv);
+        if (SUCCEEDED(ps->GetValue(PK_AUMID, &pv)) && pv.vt == VT_LPWSTR && pv.pwszVal) r = pv.pwszVal;
+        PropVariantClear(&pv);
+        ps->Release();
+    }
+    return r;
+}
+
+struct FindWin {
+    wstring aumid, stem, title;
+    HWND best = nullptr;
+    int score = 0;
+};
+static BOOL CALLBACK FindWinProc(HWND w, LPARAM lp) {
+    auto* f = (FindWin*)lp;
+    if (!IsWindowVisible(w) || GetWindow(w, GW_OWNER) || (GetWindowLongPtrW(w, GWL_EXSTYLE) & WS_EX_TOOLWINDOW)) return TRUE;
+    wchar_t title[512];
+    if (!GetWindowTextW(w, title, 512)) return TRUE;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(w, &pid);
+    int score = 0;
+    if (!f->aumid.empty() && _wcsicmp(WindowAumid(w).c_str(), f->aumid.c_str()) == 0) score += 4;
+    wstring stem = ProcessStem(pid);
+    if (!f->stem.empty() && stem == f->stem) score += 2;
+    else if (!f->aumid.empty() && StemMatchesAumid(stem, f->aumid)) score += 2;
+    if (score && !f->title.empty() && ToLower(title).find(ToLower(f->title)) != wstring::npos) score += 3;
+    if (score > f->score) { f->score = score; f->best = w; }
+    return TRUE;
+}
+
+// Bring the app's window forward; preferring the one whose title mentions `title`
+// (e.g. the browser window showing the YouTube Music tab). Returns false if none.
+static HWND g_lastActivated = nullptr;
+static bool ActivateAppWindow(const wstring& aumid, const wstring& stem, const wstring& title) {
+    FindWin f{aumid, ToLower(stem), title};
+    EnumWindows(FindWinProc, (LPARAM)&f);
+    g_lastActivated = f.best;
+    if (!f.best) return false;
+    if (IsIconic(f.best)) ShowWindow(f.best, SW_RESTORE);
+    if (!SetForegroundWindow(f.best)) {
+        // Fallback when Windows refuses: briefly attach to the foreground thread.
+        DWORD fg = GetWindowThreadProcessId(GetForegroundWindow(), nullptr), me = GetCurrentThreadId();
+        AttachThreadInput(me, fg, TRUE);
+        SetForegroundWindow(f.best);
+        BringWindowToTop(f.best);
+        AttachThreadInput(me, fg, FALSE);
+    }
+    return true;
+}
+
+// In a browser window, switch to the tab that's playing the song: the tab whose name has the
+// song's title, else one marked as playing audio, else a known music site.
+static bool SelectBrowserTab(HWND w, const wstring& title) {
+    if (!w) return false;
+    IUIAutomation* ua = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&ua)))) return false;
+    bool done = false;
+    IUIAutomationElement* root = nullptr;
+    IUIAutomationCondition* cond = nullptr;
+    IUIAutomationElementArray* arr = nullptr;
+    VARIANT v;
+    VariantInit(&v);
+    v.vt = VT_I4;
+    v.lVal = UIA_TabItemControlTypeId;
+    if (SUCCEEDED(ua->ElementFromHandle(w, &root)) && root && SUCCEEDED(ua->CreatePropertyCondition(UIA_ControlTypePropertyId, v, &cond)) &&
+        SUCCEEDED(root->FindAll(TreeScope_Descendants, cond, &arr)) && arr) {
+        int n = 0;
+        arr->get_Length(&n);
+        static const wchar_t* sites[] = {L"youtube music", L"youtube", L"spotify", L"soundcloud", L"apple music", L"deezer", L"tidal", L"pandora"};
+        wstring t = ToLower(title);
+        int bestScore = 0;
+        IUIAutomationElement* best = nullptr;
+        for (int i = 0; i < n; i++) {
+            IUIAutomationElement* e = nullptr;
+            if (FAILED(arr->GetElement(i, &e)) || !e) continue;
+            BSTR name = nullptr;
+            e->get_CurrentName(&name);
+            wstring nm = name ? ToLower(name) : L"";
+            SysFreeString(name);
+            int score = 0;
+            if (!t.empty() && nm.find(t) != wstring::npos) score += 4;
+            if (nm.find(L"audio playing") != wstring::npos || nm.find(L"playing audio") != wstring::npos) score += 2;
+            for (auto st : sites)
+                if (nm.find(st) != wstring::npos) { score += 1; break; }
+            if (score > bestScore) {
+                SafeRelease(best);
+                best = e;
+                bestScore = score;
+            } else {
+                e->Release();
+            }
+        }
+        if (best) {
+            IUIAutomationSelectionItemPattern* sel = nullptr;
+            IUIAutomationLegacyIAccessiblePattern* acc = nullptr;
+            if (SUCCEEDED(best->GetCurrentPatternAs(UIA_SelectionItemPatternId, IID_PPV_ARGS(&sel))) && sel) done = SUCCEEDED(sel->Select());
+            if (!done && SUCCEEDED(best->GetCurrentPatternAs(UIA_LegacyIAccessiblePatternId, IID_PPV_ARGS(&acc))) && acc)
+                done = SUCCEEDED(acc->DoDefaultAction());
+            SafeRelease(sel);
+            SafeRelease(acc);
+            best->Release();
+        }
+    }
+    SafeRelease(arr);
+    SafeRelease(cond);
+    SafeRelease(root);
+    ua->Release();
+    return done;
+}
+
+// ============================================================================
+// Activity: downloads in progress and Explorer file copies
+// ============================================================================
+
+struct Download {
+    wstring path, name;
+    long long size = 0, lastSize = 0;
+    double speed = 0;  // bytes/s
+    ULONGLONG since = 0;
+};
+struct CopyOp {
+    HWND hwnd = nullptr;
+    int pct = -1;
+    wstring title;
+    ULONGLONG since = 0;
+};
+
+static wstring DownloadsFolder() {
+    PWSTR p = nullptr;
+    wstring r;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Downloads, 0, nullptr, &p)) && p) r = p;
+    CoTaskMemFree(p);
+    return r;
+}
+
+static bool IsPartialDownload(const wstring& name, wstring& finalName) {
+    static const wchar_t* exts[] = {L".crdownload", L".part", L".partial", L".download", L".opdownload"};
+    wstring low = ToLower(name);
+    for (auto e : exts) {
+        size_t n = wcslen(e);
+        if (low.size() > n && low.compare(low.size() - n, n, e) == 0) {
+            finalName = name.substr(0, name.size() - n);
+            if (low.rfind(L"unconfirmed ", 0) == 0) finalName = L"Download";
+            return true;
+        }
+    }
+    return false;
+}
+
+static BOOL CALLBACK FindCopyProc(HWND w, LPARAM lp) {
+    wchar_t cls[64];
+    if (!IsWindowVisible(w) || !GetClassNameW(w, cls, 64) || wcscmp(cls, L"OperationStatusWindow") != 0) return TRUE;
+    auto* v = (std::vector<CopyOp>*)lp;
+    CopyOp c;
+    c.hwnd = w;
+    wchar_t t[256] = L"";
+    GetWindowTextW(w, t, 256);
+    c.title = t;
+    // "38% complete" (the number comes first in most languages)
+    for (const wchar_t* q = t; *q; q++)
+        if (iswdigit(*q)) {
+            int n = _wtoi(q);
+            const wchar_t* e = q;
+            while (iswdigit(*e)) e++;
+            if (*e == L'%' || (*e == L' ' && e[1] == L'%')) c.pct = std::clamp(n, 0, 100);
+            break;
+        }
+    v->push_back(c);
+    return TRUE;
 }
 
 // ============================================================================
 // UI state (UI thread only)
 // ============================================================================
 
-enum View { V_HIDDEN, V_LINE, V_NOTIF, V_DIP, V_HALF, V_EXP, V_LEVEL, V_AUTH, V_COUNT };
-enum Tab { T_ALERTS, T_MUSIC, T_CLOCK, T_SHELF, T_CLIP, T_NOTES, T_COUNT };
+enum View { V_HIDDEN, V_LINE, V_NOTIF, V_DIP, V_HALF, V_EXP, V_AUTH, V_COUNT };
+enum Tab { T_ALERTS, T_MUSIC, T_CLOCK, T_ACTIVITY, T_SHELF, T_CLIP, T_NOTES, T_COUNT };
 enum ClockMode { CM_TIMER, CM_ALARMS, CM_STOPWATCH };
 
 static const float CW = 480, CH = 340;  // canvas (DIPs); the island is centred in it
-static const wchar_t* TAB_NAMES[T_COUNT] = {L"Notifications", L"Music", L"Clock", L"Shelf", L"Clipboard", L"Notes"};
+static const wchar_t* TAB_NAMES[T_COUNT] = {L"Notifications", L"Music", L"Clock", L"Activity", L"Shelf", L"Clipboard", L"Notes"};
 
 // Click/scroll targets, rebuilt every frame (canvas DIPs).
 enum Act {
@@ -1202,7 +1472,9 @@ enum Act {
     A_S_OPEN, A_S_REMOVE, A_S_CLEAR,
     A_CL_COPY, A_CL_REMOVE, A_CL_CLEAR, A_CL_LIST,
     A_NT_AREA, A_NT_LINE, A_NT_COPY, A_NT_CLEAR,
-    A_LEVEL, A_N_LIST, A_HALF_ROW,
+    A_N_LIST, A_HALF_ROW,
+    A_H_MIC, A_ACT_MUTE, A_ACT_SHOW, A_ACT_DL, A_ACT_COPY, A_H_ACT,
+    A_AL_LIST, A_AL_REMOVE, A_AL_TIME, A_AL_ADD,
 };
 struct Hit {
     D2D1_RECT_F r;
@@ -1227,11 +1499,12 @@ struct Ui {
     int dndHeld = 0;
     bool fullscreen = false;
     float alertsScroll = 0;
-    // levels
-    int levelKind = 0, vol = 0, bri = -1;
-    bool muted = false;
-    ULONGLONG levelUntil = 0, inlineUntil = 0;
-    Spring levelV;
+    // activity
+    std::vector<MicUser> micUsers;
+    bool micMuted = false;
+    std::vector<Download> downloads;
+    std::vector<CopyOp> copies;
+    wstring dlFolder;
     // verification
     int auth = 0;  // 0 none, 1 scanning, 2 done
     ULONGLONG authAt = 0;
@@ -1249,11 +1522,17 @@ struct Ui {
     bool timerRun = false, timerPaused = false;
     double timerEnd = 0;
     int timerLeft = 0, timerDur = 0;
+    bool timerEdit = false;  // typing a custom time (digits fill from the right, like a microwave)
+    wstring timerBuf;
     bool swRun = false;
     double swStart = 0;
     long long swAcc = 0;
     std::vector<long long> laps;
-    std::vector<bool> alarmOn;
+    std::vector<AlarmCfg> alarms;  // added and removed in the Clock tab; saved
+    int newAlarm = 7 * 60;          // the time in the "add" row, minutes after midnight
+    bool alarmEdit = false;          // typing the new alarm's time
+    wstring alarmBuf;
+    float alarmScroll = 0;
     int lastAlarmMinute = -1;
     // shelf
     std::vector<wstring> shelf;
@@ -1264,7 +1543,10 @@ struct Ui {
     float clipScroll = 0;
     // notes
     std::vector<wstring> note{L""};
-    int cLine = 0, cCol = 0;
+    int cLine = 0, cCol = 0;  // caret
+    int aLine = 0, aCol = 0;  // selection anchor (same as the caret when nothing is selected)
+    int prefCol = -1;          // column kept while moving up/down
+    ULONGLONG caretAt = 0;     // the caret stays solid for a moment after it moves
     bool noteFocus = false;
     float noteScroll = 0;
     ULONGLONG noteSaveAt = 0;
@@ -1275,6 +1557,9 @@ struct Ui {
     int lastLyric = -2;
     unsigned lyrGenSeen = 0;
     bool lyrUserScrolled = false;
+    std::vector<float> lyrTop, lyrH;  // wrapped line positions
+    float lyrW = 0;
+    ULONGLONG lyrJumpAt = 0;  // a line was clicked: highlight it at once
     // half view
     float halfScroll = 0, halfContentW = 0;
     // privacy dots
@@ -1300,14 +1585,14 @@ static bool HalfHasContent() {
         std::lock_guard<std::mutex> lk(g_mx);
         media = g_media.has;
     }
-    return U.timerRun || U.swRun || U.swAcc > 0 || media || !U.list.empty() || U.mic || U.cam || U.dnd;
+    return U.timerRun || U.swRun || U.swAcc > 0 || media || !U.list.empty() || U.mic || U.cam || U.dnd || !U.downloads.empty() ||
+           !U.copies.empty();
 }
 
 static View CurrentView() {
     if (U.auth) return V_AUTH;
-    if (U.fullscreen) return g_now < U.levelUntil ? V_LEVEL : V_HIDDEN;
+    if (U.fullscreen) return V_HIDDEN;
     if (U.expanded) return V_EXP;
-    if (g_now < U.levelUntil) return V_LEVEL;
     if (U.popActive) return g_now < U.dipUntil ? V_DIP : V_NOTIF;
     if (U.halfOn && HalfHasContent()) return V_HALF;
     bool active;
@@ -1315,7 +1600,7 @@ static View CurrentView() {
         std::lock_guard<std::mutex> lk(g_mx);
         active = g_media.has;
     }
-    active = active || U.timerRun || U.swRun || U.mic || U.cam || U.dnd;
+    active = active || U.timerRun || U.swRun || U.mic || U.cam || U.dnd || !U.downloads.empty() || !U.copies.empty();
     if (!active && g_set.idleHidden) return V_HIDDEN;
     return V_LINE;
 }
@@ -1334,6 +1619,10 @@ static ID2D1Layer* g_layers[3] = {};
 static IDWriteInlineObject* g_ellipsis = nullptr;
 static wstring g_textFont = L"Segoe UI Variable Text", g_iconFont = L"Segoe Fluent Icons";
 static std::map<unsigned long long, IDWriteTextFormat*> g_formats;
+static std::vector<IDWriteInlineObject*> g_trimSigns;  // one per text format (an icon-font one drew a box)
+static std::map<wstring, float> g_widthCache;
+static std::map<wstring, double> g_marqueeStart;
+static bool g_marqueeBusy = false;
 static std::map<wstring, ID2D1Bitmap*> g_bitmaps;
 static ID2D1Bitmap* g_artBmp = nullptr;
 static unsigned g_artGenShown = 0;
@@ -1379,6 +1668,8 @@ static void ShutdownGraphics() {
     for (auto& kv : g_formats) kv.second->Release();
     g_formats.clear();
     SafeRelease(g_ellipsis);
+    for (auto* t : g_trimSigns) t->Release();
+    g_trimSigns.clear();
     for (auto& l : g_layers) SafeRelease(l);
     SafeRelease(g_br);
     SafeRelease(g_rt);
@@ -1434,29 +1725,74 @@ static IDWriteTextFormat* Fmt(float size, DWRITE_FONT_WEIGHT wt, int align, bool
     f->SetTextAlignment(align == 1 ? DWRITE_TEXT_ALIGNMENT_CENTER : align == 2 ? DWRITE_TEXT_ALIGNMENT_TRAILING : DWRITE_TEXT_ALIGNMENT_LEADING);
     f->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     f->SetWordWrapping(wrap ? DWRITE_WORD_WRAPPING_WRAP : DWRITE_WORD_WRAPPING_NO_WRAP);
-    if (!wrap) {
-        if (!g_ellipsis) g_dw->CreateEllipsisTrimmingSign(f, &g_ellipsis);
-        DWRITE_TRIMMING t{DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0};
-        f->SetTrimming(&t, g_ellipsis);
+    if (!wrap && !icon) {
+        IDWriteInlineObject* sign = nullptr;
+        if (SUCCEEDED(g_dw->CreateEllipsisTrimmingSign(f, &sign)) && sign) {
+            DWRITE_TRIMMING t{DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0};
+            f->SetTrimming(&t, sign);
+            g_trimSigns.push_back(sign);
+        }
     }
     g_formats[key] = f;
     return f;
 }
 
+static float TextW(const wstring& s, float size, DWRITE_FONT_WEIGHT wt = DWRITE_FONT_WEIGHT_NORMAL) {
+    wchar_t k[32];
+    swprintf_s(k, L"%.1f|%d|", size, (int)wt);
+    wstring key = k + s;
+    auto it = g_widthCache.find(key);
+    if (it != g_widthCache.end()) return it->second;
+    IDWriteTextLayout* l = nullptr;
+    float w = 0;
+    if (SUCCEEDED(g_dw->CreateTextLayout(s.c_str(), (UINT32)s.size(), Fmt(size, wt, 0), 4000, 100, &l))) {
+        DWRITE_TEXT_METRICS m{};
+        l->GetMetrics(&m);
+        w = m.widthIncludingTrailingWhitespace;
+        l->Release();
+    }
+    if (g_widthCache.size() > 4000) g_widthCache.clear();
+    g_widthCache[key] = w;
+    return w;
+}
+
+// Text in a box. If it doesn't fit it first gets a little smaller (down to 85%), then ends in "…".
 static void Text(const wstring& s, float x, float y, float w, float h, float size, D2D1_COLOR_F c, DWRITE_FONT_WEIGHT wt = DWRITE_FONT_WEIGHT_NORMAL,
                  int align = 0) {
     if (s.empty() || w <= 1) return;
+    float tw = TextW(s, size, wt);
+    if (tw > w) size = std::max(size * 0.85f, std::floor(size * w / tw * 4) / 4);
     g_br->SetColor(c);
     g_rt->DrawText(s.c_str(), (UINT32)s.size(), Fmt(size, wt, align), D2D1::RectF(x, y, x + w, y + h), g_br, D2D1_DRAW_TEXT_OPTIONS_CLIP);
 }
 
-static float TextW(const wstring& s, float size, DWRITE_FONT_WEIGHT wt = DWRITE_FONT_WEIGHT_NORMAL) {
-    IDWriteTextLayout* l = nullptr;
-    if (FAILED(g_dw->CreateTextLayout(s.c_str(), (UINT32)s.size(), Fmt(size, wt, 0), 4000, 100, &l))) return 0;
-    DWRITE_TEXT_METRICS m{};
-    l->GetMetrics(&m);
-    l->Release();
-    return m.widthIncludingTrailingWhitespace;
+// Text that scrolls when it doesn't fit: rests at the start, glides through, loops forever.
+static void Marquee(const wstring& s, float x, float y, float w, float h, float size, D2D1_COLOR_F c, DWRITE_FONT_WEIGHT wt = DWRITE_FONT_WEIGHT_NORMAL) {
+    if (s.empty() || w <= 1) return;
+    float tw = TextW(s, size, wt);
+    if (tw * 0.88f <= w) {  // a slightly smaller size fits: no need to move
+        Text(s, x, y, w, h, size, c, wt);
+        return;
+    }
+    const double pause = 1.6, speed = 28, gap = 36;
+    double now = QpcSeconds();
+    auto it = g_marqueeStart.find(s);
+    if (it == g_marqueeStart.end()) {
+        if (g_marqueeStart.size() > 64) g_marqueeStart.clear();
+        it = g_marqueeStart.emplace(s, now).first;
+    }
+    double travel = (tw + gap) / speed;
+    double t = std::fmod(now - it->second, pause + travel);
+    float off = t < pause ? 0 : (float)((t - pause) * speed);
+    g_rt->PushAxisAlignedClip(D2D1::RectF(x, y, x + w, y + h), D2D1_ANTIALIAS_MODE_ALIASED);
+    g_br->SetColor(c);
+    IDWriteTextFormat* f = Fmt(size, wt, 0);
+    for (int i = 0; i < 2; i++) {
+        float tx = x - off + i * (tw + (float)gap);
+        g_rt->DrawText(s.c_str(), (UINT32)s.size(), f, D2D1::RectF(tx, y, tx + tw + 4, y + h), g_br);
+    }
+    g_rt->PopAxisAlignedClip();
+    g_marqueeBusy = true;
 }
 
 static void Icon(wchar_t glyph, float cx, float cy, float size, D2D1_COLOR_F c) {
@@ -1602,8 +1938,9 @@ static float Link(const wstring& s, float xRight, float y, float h, int act, int
 namespace G {
 const wchar_t Bell = 0xEA8F, Music = 0xE8D6, Clock = 0xE916, Shelf = 0xE7B8, Clip = 0xE77F, Note = 0xE70B, Pin = 0xE718, Pinned = 0xE840,
               Play = 0xE768, Pause = 0xE769, Prev = 0xE892, Next = 0xE893, Lyrics = 0xE8E4, X = 0xE711, Plus = 0xE710, Minus = 0xE738,
-              Vol = 0xE767, Vol1 = 0xE993, Mute = 0xE74F, Sun = 0xE706, Mic = 0xE720, Cam = 0xE714, Moon = 0xE708, Lock = 0xE72E,
-              Unlock = 0xE785, Check = 0xE73E, Flag = 0xE7C1, Reset = 0xE72C, Globe = 0xE774, Doc = 0xE8A5, Code = 0xE943, Link = 0xE71B;
+              Mic = 0xE720, Moon = 0xE708, Lock = 0xE72E,
+              Unlock = 0xE785, Check = 0xE73E, Flag = 0xE7C1, Reset = 0xE72C, Globe = 0xE774, Doc = 0xE8A5, Link = 0xE71B,
+              Bolt = 0xE945, Download = 0xE896, Copy = 0xE8C8, MicOff = 0xEC54, Open = 0xE8A7;
 }
 
 // ============================================================================
@@ -1678,7 +2015,11 @@ static float PaneHeight(Tab t) {
             return has ? 118 : 40;
         }
         case T_CLOCK:
-            return U.cmode == CM_ALARMS ? 26 + std::max(1.0f, std::min<float>(3, (float)g_set.alarms.size())) * 24 : 26 + 40;
+            return U.cmode == CM_ALARMS ? 26 + std::max(1.0f, std::min<float>(3, (float)U.alarms.size())) * 24 + 30 : 26 + 40;
+        case T_ACTIVITY: {
+            size_t n = U.micUsers.size() + U.downloads.size() + U.copies.size();
+            return n ? std::min<float>(4, (float)n) * 34 + 18 : 46;
+        }
         case T_SHELF:
             return 70 + 18;
         case T_CLIP:
@@ -1691,17 +2032,19 @@ static float PaneHeight(Tab t) {
 }
 
 static float ExpandedHeight() {
-    float h = 28 + PaneHeight(U.tab) + 8;
-    if (g_now < U.inlineUntil) h += 32;
-    return h;
+    return 28 + PaneHeight(U.tab) + 8;
 }
 
 struct HalfChip {
-    int kind;  // 0 timer, 1 stopwatch, 2 music, 3 dots, 4 bell
+    int kind;  // 0 timer, 1 stopwatch, 2 music, 3 dots, 4 bell, 5 mic user, 6 download, 7 copy
     float w;
+    int idx = 0;
 };
 static std::vector<HalfChip> HalfChips() {
     std::vector<HalfChip> c;
+    for (size_t i = 0; i < U.micUsers.size() && i < 2; i++) c.push_back({5, 150, (int)i});
+    for (size_t i = 0; i < U.downloads.size() && i < 2; i++) c.push_back({6, 150, (int)i});
+    for (size_t i = 0; i < U.copies.size() && i < 2; i++) c.push_back({7, 130, (int)i});
     if (U.timerRun) c.push_back({0, 98});
     if (U.swRun || U.swAcc > 0) c.push_back({1, 108});
     bool media;
@@ -1709,8 +2052,16 @@ static std::vector<HalfChip> HalfChips() {
         std::lock_guard<std::mutex> lk(g_mx);
         media = g_media.has;
     }
-    if (media) c.push_back({2, 176});
-    if (U.mic || U.cam || U.dnd) c.push_back({3, 12.0f + (U.dnd ? 18 : 0) + (U.mic ? 10 : 0) + (U.cam ? 10 : 0)});
+    if (media) {  // as wide as the title needs (within limits), so it rarely has to scroll
+        wstring title;
+        {
+            std::lock_guard<std::mutex> lk(g_mx);
+            title = g_media.title;
+        }
+        float tw = TextW(title, 12, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+        c.push_back({2, std::clamp(48 + tw + 34, 120.0f, 250.0f)});
+    }
+    if ((U.mic && U.micUsers.empty()) || U.cam || U.dnd) c.push_back({3, 12.0f + (U.dnd ? 18 : 0) + (U.mic ? 10 : 0) + (U.cam ? 10 : 0)});
     if (!U.list.empty()) c.push_back({4, 52});
     return c;
 }
@@ -1731,7 +2082,6 @@ static D2D1_SIZE_F ViewSize(View v) {
             return {std::clamp(t, 150.0f, HALF_MAX), 32};
         }
         case V_EXP: return {EXP_W, ExpandedHeight()};
-        case V_LEVEL: return {320, 36};
         case V_AUTH: return {206, 36};
         default: return {90, 6};
     }
@@ -1741,6 +2091,28 @@ static D2D1_SIZE_F ViewSize(View v) {
 // Drawing each view. Every function draws at (x, 0) with the view's own size
 // and records hits in canvas coordinates.
 // ============================================================================
+
+static wstring FmtBytes(long long b) {
+    wchar_t s[32];
+    if (b >= 1LL << 30) swprintf_s(s, L"%.1f GB", b / 1073741824.0);
+    else if (b >= 1LL << 20) swprintf_s(s, L"%.1f MB", b / 1048576.0);
+    else swprintf_s(s, L"%lld KB", b / 1024);
+    return s;
+}
+static wstring MicDuration(const MicUser& u) {
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    ULONGLONG nowFt = ((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    return FmtClock(nowFt > u.start ? (long long)((nowFt - u.start) / 10000000ULL) : 0);
+}
+
+// Tiles for the island's own notifications (timer, downloads, copies, Do not disturb).
+static wchar_t InternalGlyph(const wstring& app) {
+    return app == L"Downloads" ? G::Download : app == L"File Explorer" ? G::Copy : app == L"Do not disturb" ? G::Moon : G::Clock;
+}
+static UINT32 InternalColor(const wstring& app) {
+    return app == L"Downloads" ? 0x2F7DE1 : app == L"File Explorer" ? 0xD9A530 : app == L"Do not disturb" ? 0x6B5BD6 : ORANGE;
+}
 
 static void DrawLine(float x, float w, float h) {
     if (h < 8.5f) return;
@@ -1753,25 +2125,12 @@ static void DrawLine(float x, float w, float h) {
 
 static void DrawNotif(float x) {
     const Notif& n = U.pop;
-    AppTile(n.aumid, n.app, x + 16, 8, 18, n.aumid.empty() ? G::Clock : 0, n.aumid.empty() ? ORANGE : 0x5A6470);
+    AppTile(n.aumid, n.app, x + 16, 8, 18, n.aumid.empty() ? InternalGlyph(n.app) : 0, n.aumid.empty() ? InternalColor(n.app) : 0x5A6470);
     float tx = x + 42, maxW = 300 - 42 - 16;
     float tw = std::min(112.0f, TextW(n.title, 12, DWRITE_FONT_WEIGHT_SEMI_BOLD) + 1);
     Text(n.title, tx, 0, tw, 34, 12, Wh(1), DWRITE_FONT_WEIGHT_SEMI_BOLD);
-    Text(n.body, tx + tw + 8, 0, maxW - tw - 8, 34, 12, Wh(0.72f));
+    Marquee(n.body, tx + tw + 8, 0, maxW - tw - 8, 34, 12, Wh(0.72f));
     AddHit(x, 0, 300, 34, A_POPUP);
-}
-
-static void DrawLevel(float x, float w, float h, int kind, float y = 0) {
-    wchar_t g = kind == 1 ? G::Sun : (U.muted || U.vol == 0) ? G::Mute : U.vol < 50 ? G::Vol1 : G::Vol;
-    int val = kind == 1 ? std::max(0, U.bri) : U.vol;
-    Icon(g, x + 18, y + h / 2, 12, Wh(0.95f));
-    Text(kind == 1 ? L"Brightness" : L"Sound", x + 32, y, 70, h, 11.5f, Wh(1), DWRITE_FONT_WEIGHT_SEMI_BOLD);
-    float bx = x + 106, bw = w - 106 - 40;
-    FillRR(bx, y + h / 2 - 2, bw, 4, 2, Wh(0.18f));
-    float frac = std::clamp((float)U.levelV.v / 100.0f, 0.0f, 1.0f);
-    if (frac > 0) FillRR(bx, y + h / 2 - 2, bw * frac, 4, 2, Wh(1));
-    Text(std::to_wstring(val), x + w - 36, y, 24, h, 11, Wh(0.6f), DWRITE_FONT_WEIGHT_NORMAL, 2);
-    AddHit(bx - 6, y + 4, bw + 12, h - 8, A_LEVEL, kind);
 }
 
 static void DrawAuth(float x) {
@@ -1829,7 +2188,7 @@ static void DrawHalf(float x, float w) {
             if (g_artBmp) DrawRounded(g_artBmp, cx + 8, 7, 18, 18, 4);
             else FillRR(cx + 8, 7, 18, 18, 4, Col(0xD93A64));
             DrawEq(cx + 32, 16, m.playing, Col(0xFFB07A));
-            Text(m.title, cx + 48, 0, cw - 48 - 30, 32, 12, Wh(1), DWRITE_FONT_WEIGHT_SEMI_BOLD);
+            Marquee(m.title, cx + 48, 0, cw - 48 - 30, 32, 12, Wh(1), DWRITE_FONT_WEIGHT_SEMI_BOLD);
             AddHit(cx, 0, cw, 32, A_CHIP, T_MUSIC);
             Btn(right - 20, 6, 20, m.playing ? G::Pause : G::Play, A_H_PLAY, 0, 9);
             if (m.durMs > 0) FillR(cx + 8, 29, (cw - 16) * (float)m.posMs / (float)m.durMs, 1.5f, Wh(0.55f));
@@ -1838,6 +2197,28 @@ static void DrawHalf(float x, float w) {
             if (U.dnd) { Icon(G::Moon, dx + 6, 16, 10, Col(0xB6A8FF)); dx += 18; }
             if (U.cam) { Circle(dx + 3, 16, 3, Col(GREEN)); dx += 10; }
             if (U.mic) Circle(dx + 3, 16, 3, Col(ORANGE));
+        } else if (c.kind == 5 && c.idx < (int)U.micUsers.size()) {
+            auto& u = U.micUsers[c.idx];
+            Circle(cx + 14, 16, 3.5f, Col(U.micMuted ? 0xFF8A80 : GREEN));
+            Marquee(u.name, cx + 24, 0, cw - 24 - 74, 32, 12, Wh(1), DWRITE_FONT_WEIGHT_SEMI_BOLD);
+            Text(MicDuration(u), cx + cw - 76, 0, 44, 32, 11.5f, Wh(0.6f), DWRITE_FONT_WEIGHT_NORMAL, 2);
+            AddHit(cx, 0, cw, 32, A_CHIP, T_ACTIVITY);
+            Btn(right - 20, 6, 20, U.micMuted ? G::MicOff : G::Mic, A_H_MIC, 0, 9, U.micMuted ? Col(0xFF8A80) : Wh(0.9f));
+        } else if (c.kind == 6 && c.idx < (int)U.downloads.size()) {
+            auto& d = U.downloads[c.idx];
+            float a = (float)std::fmod(QpcSeconds(), 1.2) / 1.2f * 6.2832f;
+            Ring(cx + 17, 16, 7, 0, Wh(0.15f), Col(0x8CC8F2), 2);  // a dot circling: no total size is known
+            Circle(cx + 17 + 7 * std::sin(a), 16 - 7 * std::cos(a), 1.8f, Col(0x8CC8F2));
+            Icon(G::Download, cx + 17, 16, 7, Wh(0.85f));
+            Marquee(d.name, cx + 30, 0, cw - 30 - 54, 32, 12, Wh(1), DWRITE_FONT_WEIGHT_SEMI_BOLD);
+            Text(FmtBytes(d.size), cx + cw - 58, 0, 52, 32, 11, Wh(0.55f), DWRITE_FONT_WEIGHT_NORMAL, 2);
+            AddHit(cx, 0, cw, 32, A_CHIP, T_ACTIVITY);
+        } else if (c.kind == 7 && c.idx < (int)U.copies.size()) {
+            auto& cp = U.copies[c.idx];
+            Ring(cx + 17, 16, 7, cp.pct > 0 ? cp.pct / 100.0f : 0, Wh(0.15f), Col(0xF2C14E), 2);
+            Text(L"Copying", cx + 30, 0, cw - 30 - 40, 32, 12, Wh(1), DWRITE_FONT_WEIGHT_SEMI_BOLD);
+            Text(cp.pct >= 0 ? std::to_wstring(cp.pct) + L"%" : L"…", cx + cw - 44, 0, 36, 32, 11.5f, Wh(0.6f), DWRITE_FONT_WEIGHT_NORMAL, 2);
+            AddHit(cx, 0, cw, 32, A_CHIP, T_ACTIVITY);
         } else if (c.kind == 4) {
             Icon(G::Bell, cx + 17, 16, 11, Wh(0.9f));
             wstring n = std::to_wstring(U.list.size());
@@ -1872,7 +2253,7 @@ static void PaneAlerts(float x, float y, float w) {
             const Notif& n = U.list[i];
             bool hov = Hovered(x, ry, w, 24) && U.mouse.y >= y && U.mouse.y < y + listH;
             if (hov) FillRR(x - 4, ry + 1, w + 8, 22, 6, Wh(0.06f));
-            AppTile(n.aumid, n.app, x, ry + 4, 16, n.aumid.empty() ? G::Clock : 0, n.aumid.empty() ? ORANGE : 0x5A6470);
+            AppTile(n.aumid, n.app, x, ry + 4, 16, n.aumid.empty() ? InternalGlyph(n.app) : 0, n.aumid.empty() ? InternalColor(n.app) : 0x5A6470);
             float aw = std::min(110.0f, TextW(n.app, 11.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD) + 1);
             Text(n.app, x + 24, ry, aw, 24, 11.5f, Wh(1), DWRITE_FONT_WEIGHT_SEMI_BOLD);
             wstring rest = L" · " + n.title + (n.body.empty() ? L"" : L" · " + n.body);
@@ -1927,31 +2308,61 @@ static void PaneMusic(float x, float y, float w) {
         Text(m.lyrState == 4 ? L"Lyrics lookup is off in settings" : L"None found for this song", rx, y + 52, rw, 16, 10.5f, Wh(0.5f),
              DWRITE_FONT_WEIGHT_NORMAL, 1);
     } else {
-        const float LH = 26;
         bool timed = m.lyrState == 1;
         int cur = CurrentLyric(m);
-        if (m.lyrGen != U.lyrGenSeen) { U.lyrGenSeen = m.lyrGen; U.lyrScroll = {}; U.lastLyric = -2; U.lyrTarget = 0; }
-        float contentH = m.lyrics.size() * LH;
-        float maxS = std::max(0.0f, contentH - rh + LH);
+        if (m.lyrGen != U.lyrGenSeen || std::fabs(U.lyrW - rw) > 0.5f || U.lyrH.size() != m.lyrics.size()) {
+            // Measure each line wrapped to the column (bold, so the current line never re-wraps).
+            U.lyrGenSeen = m.lyrGen;
+            U.lyrW = rw;
+            U.lyrTop.assign(m.lyrics.size(), 0);
+            U.lyrH.assign(m.lyrics.size(), 0);
+            float acc = 0;
+            for (size_t i = 0; i < m.lyrics.size(); i++) {
+                const wstring& t = m.lyrics[i].text.empty() ? wstring(L"♪") : m.lyrics[i].text;
+                float hh = 22;
+                IDWriteTextLayout* l = nullptr;
+                if (SUCCEEDED(g_dw->CreateTextLayout(t.c_str(), (UINT32)t.size(), Fmt(12.5f, DWRITE_FONT_WEIGHT_BOLD, 0, false, true), rw, 1000, &l))) {
+                    DWRITE_TEXT_METRICS tm{};
+                    l->GetMetrics(&tm);
+                    hh = std::max(22.0f, tm.height + 7);
+                    l->Release();
+                }
+                U.lyrTop[i] = acc;
+                U.lyrH[i] = hh;
+                acc += hh;
+            }
+            U.lastLyric = -2;
+        }
+        float contentH = U.lyrTop.empty() ? 0 : U.lyrTop.back() + U.lyrH.back();
+        float pad = rh / 2;  // room above the first and below the last line so both can sit in the middle
+        float maxS = std::max(0.0f, contentH + pad * 2 - rh);
         if (timed && cur != U.lastLyric) {  // follow the song: centre the current line at every change
             U.lastLyric = cur;
             U.lyrUserScrolled = false;
-            U.lyrTarget = std::clamp(std::max(0, cur) * LH - rh / 2 + LH / 2 + LH / 2, 0.0f, maxS);
+            int c = std::max(0, cur);
+            U.lyrTarget = c < (int)U.lyrTop.size() ? std::clamp(pad + U.lyrTop[c] + U.lyrH[c] / 2 - rh / 2, 0.0f, maxS) : 0;
             Wake();
         }
         U.lyrScroll.v = std::clamp((float)U.lyrScroll.v, 0.0f, maxS);
         AddHit(rx, y, rw, rh, A_M_LYRLIST);
         g_rt->PushAxisAlignedClip(D2D1::RectF(rx - 4, y, x + w + 2, y + rh), D2D1_ANTIALIAS_MODE_ALIASED);
         for (size_t i = 0; i < m.lyrics.size(); i++) {
-            float ly = y + LH / 2 + i * LH - (float)U.lyrScroll.v;
-            if (ly + LH < y || ly > y + rh) continue;
+            float lh = U.lyrH[i];
+            float ly = y + pad + U.lyrTop[i] - (float)U.lyrScroll.v;
+            if (ly + lh < y || ly > y + rh) continue;
             bool isCur = timed && (int)i == cur;
             float a = !timed ? 0.8f : isCur ? 1.0f : (int)i < cur ? 0.55f : 0.42f;
-            bool hov = timed && Hovered(rx - 4, ly, rw + 8, LH) && U.mouse.y >= y && U.mouse.y < y + rh;
-            if (hov) FillRR(rx - 4, ly + 2, rw + 8, LH - 4, 6, Wh(0.07f));
-            Text(m.lyrics[i].text.empty() ? L"♪" : m.lyrics[i].text, rx, ly, rw, LH, isCur ? 13 : 12.5f, Wh(a),
-                 isCur ? DWRITE_FONT_WEIGHT_BOLD : DWRITE_FONT_WEIGHT_MEDIUM);
-            if (timed && ly >= y && ly + LH <= y + rh) AddHit(rx - 4, ly, rw + 8, LH, A_M_LINE, (int)i);
+            bool hov = timed && Hovered(rx - 4, ly, rw + 8, lh) && U.mouse.y >= y && U.mouse.y < y + rh;
+            if (hov) FillRR(rx - 4, ly + 1, rw + 8, lh - 2, 6, Wh(0.07f));
+            const wstring& t = m.lyrics[i].text.empty() ? wstring(L"♪") : m.lyrics[i].text;
+            g_br->SetColor(Wh(a));
+            g_rt->DrawText(t.c_str(), (UINT32)t.size(),
+                           Fmt(12.5f, isCur ? DWRITE_FONT_WEIGHT_BOLD : DWRITE_FONT_WEIGHT_MEDIUM, 0, false, true),
+                           D2D1::RectF(rx, ly, rx + rw, ly + lh), g_br);
+            if (timed) {
+                float top = std::max(ly, y), bot = std::min(ly + lh, y + rh);
+                if (bot - top > 6) AddHit(rx - 4, top, rw + 8, bot - top, A_M_LINE, (int)i);
+            }
         }
         g_rt->PopAxisAlignedClip();
     }
@@ -2022,8 +2433,17 @@ static void PaneClock(float x, float y, float w) {
             Btn(x + w - 28, y + 8, 24, G::X, A_T_CANCEL, 0, 9);
         } else {
             Btn(x - 2, y + 8, 24, G::Minus, A_T_MINUS, 0, 10);
-            wstring t = FmtClock(U.timerSet);
-            Text(t, x + 22, y, 64, 40, 22, Wh(1), DWRITE_FONT_WEIGHT_SEMI_BOLD, 1);
+            if (U.timerEdit) {  // typed digits fill from the right: "5" -> 0:05, "530" -> 5:30
+                wstring d = U.timerBuf;
+                while (d.size() < 3) d.insert(d.begin(), L'0');
+                wstring t = d.substr(0, d.size() - 2) + L":" + d.substr(d.size() - 2);
+                while (t.size() > 4 && t[0] == L'0') t.erase(t.begin());
+                FillRR(x + 22, y + 6, 64, 28, 7, D2D1::ColorF(ORANGE, 0.16f));
+                Text(t, x + 22, y, 64, 40, 22, Col(ORANGE_L), DWRITE_FONT_WEIGHT_SEMI_BOLD, 1);
+                if ((GetTickCount64() / 530) % 2 == 0) FillR(x + 22 + 32 + TextW(t, 22, DWRITE_FONT_WEIGHT_SEMI_BOLD) / 2 + 1, y + 10, 1.5f, 20, Col(ORANGE));
+            } else {
+                Text(FmtClock(U.timerSet), x + 22, y, 64, 40, 22, Hovered(x + 22, y, 64, 40) ? Col(ORANGE_L) : Wh(1), DWRITE_FONT_WEIGHT_SEMI_BOLD, 1);
+            }
             AddHit(x + 22, y, 64, 40, A_T_DIGITS);
             Btn(x + 86, y + 8, 24, G::Plus, A_T_PLUS, 0, 10);
             int presets[3] = {5, 10, 25};
@@ -2043,22 +2463,53 @@ static void PaneClock(float x, float y, float w) {
             AddHit(x + w - sw, y + 10, sw, 20, A_T_START);
         }
     } else if (U.cmode == CM_ALARMS) {
-        if (g_set.alarms.empty()) {
-            Text(L"Add alarms in the mod's settings", x, y, w, 24, 11.5f, Wh(0.5f), DWRITE_FONT_WEIGHT_NORMAL, 1);
-        }
-        for (size_t i = 0; i < g_set.alarms.size() && i < 3; i++) {
-            auto& a = g_set.alarms[i];
-            float ry = y + i * 24;
+        float listH = std::max(1.0f, std::min<float>(3, (float)U.alarms.size())) * 24;
+        if (U.alarms.empty()) Text(L"No alarms yet: add one below", x, y, w, 24, 11.5f, Wh(0.5f), DWRITE_FONT_WEIGHT_NORMAL, 1);
+        float maxS = std::max(0.0f, U.alarms.size() * 24.0f - listH);
+        U.alarmScroll = std::clamp(U.alarmScroll, 0.0f, maxS);
+        AddHit(x, y, w, listH, A_AL_LIST);
+        g_rt->PushAxisAlignedClip(D2D1::RectF(x - 4, y, x + w + 4, y + listH), D2D1_ANTIALIAS_MODE_ALIASED);
+        for (size_t i = 0; i < U.alarms.size(); i++) {
+            float ry = y + i * 24 - U.alarmScroll;
+            if (ry + 24 < y || ry > y + listH) continue;
+            auto& a = U.alarms[i];
+            bool hov = Hovered(x - 4, ry, w + 8, 24) && U.mouse.y >= y && U.mouse.y < y + listH;
+            if (hov) FillRR(x - 4, ry + 1, w + 8, 22, 6, Wh(0.05f));
             SYSTEMTIME at{};
             at.wHour = (WORD)a.hour;
             at.wMinute = (WORD)a.minute;
-            Text(FmtTimeOfDay(at), x, ry, 76, 24, 13, Wh(1), DWRITE_FONT_WEIGHT_SEMI_BOLD);
-            Text(a.label, x + 80, ry, w - 80 - 44, 24, 11.5f, Wh(0.6f));
-            bool on = i < U.alarmOn.size() && U.alarmOn[i];
+            Text(FmtTimeOfDay(at), x, ry, 76, 24, 13, Wh(a.enabled ? 1 : 0.5f), DWRITE_FONT_WEIGHT_SEMI_BOLD);
+            Text(a.label, x + 80, ry, w - 80 - 70, 24, 11.5f, Wh(0.6f));
+            if (hov) Btn(x + w - 62, ry + 2, 20, G::X, A_AL_REMOVE, (int)i, 9);
+            bool on = a.enabled;
             FillRR(x + w - 32, ry + 5, 30, 14, 7, on ? Col(ORANGE) : Wh(0.22f));
             Circle(on ? x + w - 10 : x + w - 25, ry + 12, 5, on ? Col(0x1D1200) : Wh(0.9f));
             AddHit(x + w - 36, ry, 38, 24, A_AL_TOGGLE, (int)i);
         }
+        g_rt->PopAxisAlignedClip();
+        // Add row: a time (scroll the hour/minutes, or click and type "0730") and an Add button.
+        float ay = y + listH + 4;
+        FillR(x, ay - 2, w, 1, Wh(0.07f));
+        Text(L"New alarm", x, ay + 2, 70, 22, 11, Wh(0.55f));
+        float tx = x + 74, tw = 76;
+        FillRR(tx, ay + 3, tw, 20, 6, U.alarmEdit ? D2D1::ColorF(ORANGE, 0.16f) : Wh(Hovered(tx, ay + 3, tw, 20) ? 0.1f : 0.06f));
+        wstring shown;
+        if (U.alarmEdit) {
+            wstring d = U.alarmBuf;
+            while (d.size() < 4) d.insert(d.begin(), L'-');
+            shown = d.substr(0, 2) + L":" + d.substr(2, 2);
+        } else {
+            SYSTEMTIME at{};
+            at.wHour = (WORD)(U.newAlarm / 60);
+            at.wMinute = (WORD)(U.newAlarm % 60);
+            shown = FmtTimeOfDay(at);
+        }
+        Text(shown, tx, ay + 3, tw, 20, 12, U.alarmEdit ? Col(ORANGE_L) : Wh(0.95f), DWRITE_FONT_WEIGHT_SEMI_BOLD, 1);
+        AddHit(tx, ay + 3, tw, 20, A_AL_TIME);
+        float bw = 52;
+        FillRR(x + w - bw, ay + 3, bw, 20, 10, Col(Hovered(x + w - bw, ay + 3, bw, 20) ? 0xFFB340 : ORANGE));
+        Text(L"Add", x + w - bw, ay + 3, bw, 20, 11.5f, Col(0x1D1200), DWRITE_FONT_WEIGHT_SEMI_BOLD, 1);
+        AddHit(x + w - bw, ay + 3, bw, 20, A_AL_ADD);
     } else {
         long long ms = StopwatchMs();
         Text(FmtStopwatch(ms), x, y, 110, 40, 21, Col(ORANGE_L), DWRITE_FONT_WEIGHT_SEMI_BOLD);
@@ -2073,6 +2524,55 @@ static void PaneClock(float x, float y, float w) {
         AddHit(bx, y + 10, 64, 20, A_SW_GO);
         Btn(x + w - 42, y + 8, 24, U.swRun ? G::Flag : G::Reset, A_SW_LAP, 0, 10);
     }
+}
+
+static void PaneActivity(float x, float y, float w) {
+    size_t n = U.micUsers.size() + U.downloads.size() + U.copies.size();
+    if (!n) {
+        Text(L"Nothing running", x, y, w, 26, 12, Wh(0.5f), DWRITE_FONT_WEIGHT_NORMAL, 1);
+        Text(L"Downloads, file copies and apps using your microphone show here", x, y + 26, w, 18, 10.5f, Wh(0.45f), DWRITE_FONT_WEIGHT_NORMAL, 1);
+        return;
+    }
+    float ry = y;
+    int shown = 0;
+    for (size_t i = 0; i < U.micUsers.size() && shown < 4; i++, shown++, ry += 34) {
+        auto& u = U.micUsers[i];
+        FillRR(x, ry + 5, 24, 24, 7, Col(GREEN, 0.18f));
+        Icon(U.micMuted ? G::MicOff : G::Mic, x + 12, ry + 17, 11, U.micMuted ? Col(0xFF8A80) : Col(GREEN));
+        Text(u.name, x + 32, ry + 2, w - 32 - 60, 18, 12.5f, Wh(1), DWRITE_FONT_WEIGHT_SEMI_BOLD);
+        Text(L"Using your microphone · " + MicDuration(u) + (U.micMuted ? L" · muted" : L""), x + 32, ry + 18, w - 32 - 60, 14, 10.5f, Wh(0.55f));
+        Btn(x + w - 54, ry + 5, 24, U.micMuted ? G::MicOff : G::Mic, A_ACT_MUTE, 0, 10, U.micMuted ? Col(0xFF8A80) : Wh(0.9f), U.micMuted);
+        Btn(x + w - 26, ry + 5, 24, G::Open, A_ACT_SHOW, (int)i, 10);
+    }
+    for (size_t i = 0; i < U.downloads.size() && shown < 4; i++, shown++, ry += 34) {
+        auto& d = U.downloads[i];
+        FillRR(x, ry + 5, 24, 24, 7, Col(0x2F7DE1, 0.2f));
+        Icon(G::Download, x + 12, ry + 17, 11, Col(0x8CC8F2));
+        Text(d.name, x + 32, ry + 2, w - 32 - 30, 18, 12.5f, Wh(1), DWRITE_FONT_WEIGHT_SEMI_BOLD);
+        wstring st = FmtBytes(d.size) + (d.speed > 1024 ? L" · " + FmtBytes((long long)d.speed) + L"/s" : wstring(L" · waiting"));
+        Text(st, x + 32, ry + 18, w - 32 - 30, 14, 10.5f, Wh(0.55f));
+        // No total size is known: an indeterminate shimmer.
+        float t = (float)std::fmod(QpcSeconds(), 1.6) / 1.6f;
+        FillRR(x + 32, ry + 32, w - 32, 2, 1, Wh(0.1f));
+        float sx = x + 32 + (w - 32) * (t * 1.3f - 0.3f);
+        float ex = std::min(x + w, sx + (w - 32) * 0.3f);
+        sx = std::max(sx, x + 32);
+        if (ex > sx) FillRR(sx, ry + 32, ex - sx, 2, 1, Col(0x8CC8F2));
+        Btn(x + w - 26, ry + 5, 24, G::Open, A_ACT_DL, (int)i, 10);
+    }
+    for (size_t i = 0; i < U.copies.size() && shown < 4; i++, shown++, ry += 34) {
+        auto& c = U.copies[i];
+        FillRR(x, ry + 5, 24, 24, 7, Col(0xD9A530, 0.2f));
+        Icon(G::Copy, x + 12, ry + 17, 11, Col(0xF2C14E));
+        Text(L"Copying files", x + 32, ry + 2, w - 32 - 30, 18, 12.5f, Wh(1), DWRITE_FONT_WEIGHT_SEMI_BOLD);
+        Text(c.pct >= 0 ? std::to_wstring(c.pct) + L"% · File Explorer" : c.title, x + 32, ry + 18, w - 32 - 30, 14, 10.5f, Wh(0.55f));
+        FillRR(x + 32, ry + 32, w - 32, 2, 1, Wh(0.1f));
+        if (c.pct > 0) FillRR(x + 32, ry + 32, (w - 32) * c.pct / 100.0f, 2, 1, Col(0xF2C14E));
+        Btn(x + w - 26, ry + 5, 24, G::Open, A_ACT_COPY, (int)i, 10);
+    }
+    ry = y + std::min<float>(4, (float)n) * 34 + 2;
+    Text(U.micUsers.empty() ? L"Downloads come from your Downloads folder" : L"Mute turns your microphone off for every app", x, ry, w, 16, 10.5f,
+         Wh(0.45f));
 }
 
 static void PaneShelf(float x, float y, float w) {
@@ -2205,16 +2705,37 @@ static void PaneNotes(float x, float y, float w) {
     g_rt->PushAxisAlignedClip(D2D1::RectF(x + 2, y + 4, x + w - 2, y + NOTE_H - 4), D2D1_ANTIALIAS_MODE_ALIASED);
     if (empty && !focus) Text(L"Jot something down… it saves as you type", x + NOTE_PAD, y + 7, iw, NOTE_LH, 12.5f, Wh(0.35f));
     float ly = y + 7 - U.noteScroll;
-    bool blink = ((GetTickCount64() / 530) % 2) == 0;
+    bool blink = ((GetTickCount64() - U.caretAt) % 1060) < 600;  // solid while you type or move, then blinks
+    bool aFirst = U.aLine < U.cLine || (U.aLine == U.cLine && U.aCol <= U.cCol);
+    int sl = aFirst ? U.aLine : U.cLine, sc = aFirst ? U.aCol : U.cCol;
+    int el = aFirst ? U.cLine : U.aLine, ec = aFirst ? U.cCol : U.aCol;
+    bool sel = !(U.aLine == U.cLine && U.aCol == U.cCol);
+    D2D1_COLOR_F selCol = D2D1::ColorF(BLUE, focus ? 0.38f : 0.2f);
     for (size_t i = 0; i < U.note.size(); i++) {
         const wstring& s = U.note[i];
         float lh = NoteLineHeight(s, iw);
+        bool inSel = sel && (int)i >= sl && (int)i <= el;
+        int s0 = inSel ? ((int)i == sl ? sc : 0) : 0;
+        int s1 = inSel ? ((int)i == el ? ec : (s == L"---" ? 1 : (int)s.size())) : 0;
         if (s == L"---") {
+            if (inSel && s1 > s0) FillRR(x + NOTE_PAD - 2, ly, iw + 4, 13, 3, selCol);
             FillR(x + NOTE_PAD, ly + 6, iw, 1, Wh(0.28f));  // exactly the text area's width
             if (focus && (int)i == U.cLine && blink) FillR(x + NOTE_PAD + (U.cCol ? iw : 0) - 1, ly, 1.5f, 13, Col(BLUE));
         } else {
             IDWriteTextLayout* l = NoteLayout(s, iw);
             if (l) {
+                if (inSel) {  // selection boxes for this line (plus a sliver for the line break)
+                    DWRITE_HIT_TEST_METRICS ms[16];
+                    UINT32 got = 0;
+                    if (s1 > s0 && SUCCEEDED(l->HitTestTextRange((UINT32)s0, (UINT32)(s1 - s0), 0, 0, ms, 16, &got)))
+                        for (UINT32 k = 0; k < got; k++) FillR(x + NOTE_PAD + ms[k].left, ly + ms[k].top, ms[k].width, ms[k].height, selCol);
+                    if ((int)i < el) {
+                        DWRITE_HIT_TEST_METRICS hm{};
+                        FLOAT ex = 0, ey = 0;
+                        l->HitTestTextPosition((UINT32)s.size(), FALSE, &ex, &ey, &hm);
+                        FillR(x + NOTE_PAD + ex, ly + ey, 5, std::max(14.0f, hm.height), selCol);
+                    }
+                }
                 g_br->SetColor(D2D1::ColorF(0xF4F5F7, 1));
                 g_rt->DrawTextLayout(D2D1::Point2F(x + NOTE_PAD, ly), l, g_br);
                 if (focus && (int)i == U.cLine && blink) {
@@ -2241,7 +2762,7 @@ static void PaneNotes(float x, float y, float w) {
 
 static void DrawExpanded(float x, float w) {
     // Tab bar: four on the left, three + pin on the right, the section name between.
-    static const wchar_t icons[T_COUNT] = {G::Bell, G::Music, G::Clock, G::Shelf, G::Clip, G::Note};
+    static const wchar_t icons[T_COUNT] = {G::Bell, G::Music, G::Clock, G::Bolt, G::Shelf, G::Clip, G::Note};
     bool live[T_COUNT] = {};
     {
         std::lock_guard<std::mutex> lk(g_mx);
@@ -2249,8 +2770,9 @@ static void DrawExpanded(float x, float w) {
     }
     live[T_ALERTS] = U.popActive;
     live[T_CLOCK] = (U.timerRun && !U.timerPaused) || U.swRun;
+    live[T_ACTIVITY] = !U.micUsers.empty() || !U.downloads.empty() || !U.copies.empty();
     float bx = x + 7;
-    for (int t = 0; t < 3; t++) {
+    for (int t = 0; t < 4; t++) {
         bool on = U.tab == t;
         if (on || Hovered(bx, 3, 22, 18)) FillRR(bx, 3, 22, 18, 6, Wh(on ? 0.13f : 0.07f));
         Icon(icons[t], bx + 11, 12, 10.5f, Wh(on ? 1 : 0.5f));
@@ -2258,9 +2780,9 @@ static void DrawExpanded(float x, float w) {
         AddHit(bx, 3, 22, 18, A_TAB, t);
         bx += 24;
     }
-    Text(TAB_NAMES[U.tab], x + 90, 2, w - 180, 20, 10.5f, Wh(0.6f), DWRITE_FONT_WEIGHT_SEMI_BOLD, 1);
+    Text(TAB_NAMES[U.tab], x + 104, 2, w - 208, 20, 10.5f, Wh(0.6f), DWRITE_FONT_WEIGHT_SEMI_BOLD, 1);
     bx = x + w - 7 - 24 * 4 + 2;
-    for (int t = 3; t < T_COUNT; t++) {
+    for (int t = 4; t < T_COUNT; t++) {
         bool on = U.tab == t;
         if (on || Hovered(bx, 3, 22, 18)) FillRR(bx, 3, 22, 18, 6, Wh(on ? 0.13f : 0.07f));
         Icon(icons[t], bx + 11, 12, 10.5f, Wh(on ? 1 : 0.5f));
@@ -2276,15 +2798,11 @@ static void DrawExpanded(float x, float w) {
         case T_ALERTS: PaneAlerts(px, py, pw); break;
         case T_MUSIC: PaneMusic(px, py, pw); break;
         case T_CLOCK: PaneClock(px, py, pw); break;
+        case T_ACTIVITY: PaneActivity(px, py, pw); break;
         case T_SHELF: PaneShelf(px, py, pw); break;
         case T_CLIP: PaneClip(px, py, pw); break;
         case T_NOTES: PaneNotes(px, py, pw); break;
         default: break;
-    }
-    if (g_now < U.inlineUntil) {  // volume/brightness changed while open: a compact row under the pane
-        float ly = py + PaneHeight(U.tab) + 4;
-        FillRR(px, ly, pw, 26, 9, Wh(0.06f));
-        DrawLevel(px - 4, pw + 8, 26, U.levelKind, ly);
     }
 }
 
@@ -2330,7 +2848,6 @@ static bool Step(double dt) {
         if (std::fabs(tgt - U.op[i]) < 0.003 && (i != v || tgt == 1 || tgt == 0)) U.op[i] = (float)tgt;
         else busy = true;
     }
-    busy |= SpringStep(U.levelV, U.levelKind == 1 ? std::max(0, U.bri) : U.vol, 0.18, dt, 1, 0.05);
     if (!U.lyrUserScrolled) busy |= SpringStep(U.lyrScroll, U.lyrTarget, 0.4, dt, 1, 0.3);
     // Things that move on their own while visible.
     bool mediaPlaying;
@@ -2340,13 +2857,14 @@ static bool Step(double dt) {
     }
     if (v == V_HALF && (mediaPlaying || U.swRun)) busy = true;
     if (v == V_EXP && ((U.tab == T_MUSIC && mediaPlaying) || (U.tab == T_CLOCK && U.swRun) || (U.tab == T_NOTES && U.noteFocus))) busy = true;
-    if (v == V_AUTH || U.dipUntil > g_now || U.levelUntil > g_now || U.inlineUntil > g_now) busy = true;
+    if (v == V_AUTH || U.dipUntil > g_now || (v == V_EXP && U.tab == T_ACTIVITY && !U.downloads.empty())) busy = true;
     return busy;
 }
 
 static void Render() {
     EnsureSurface();
     g_hits.clear();
+    g_marqueeBusy = false;
     View v = U.lastView;
     float hv = (float)U.hov.v;
     bool thin = U.h.v < 12;
@@ -2387,7 +2905,6 @@ static void Render() {
                         case V_NOTIF: DrawNotif(vx); break;
                         case V_HALF: DrawHalf(vx, vs.width); break;
                         case V_EXP: DrawExpanded(vx, vs.width); break;
-                        case V_LEVEL: DrawLevel(vx, vs.width, 36, U.levelKind); break;
                         case V_AUTH: DrawAuth(vx); break;
                     }
                     // Only the settled current view takes clicks.
@@ -2474,6 +2991,7 @@ static void OnFrame() {
     g_lastFrame = t;
     bool busy = Step(dt);
     Render();
+    busy |= g_marqueeBusy;  // scrolling text keeps the frames coming
     UpdateExStyle();
     InstallMouseHookIfNeeded();
     UpdatePointerTimer();
@@ -2502,7 +3020,7 @@ static void Reposition() {
 static D2D1_POINT_2F ClientToCanvas(int x, int y) { return D2D1::Point2F(x / g_scale, y / g_scale); }
 static D2D1_POINT_2F ScreenToCanvas(POINT p) { return D2D1::Point2F((p.x - g_winPos.x) / g_scale, (p.y - g_winPos.y) / g_scale); }
 
-static bool IsBackgroundAct(int a) { return a == A_HALF_ROW || a == A_N_LIST || a == A_CL_LIST || a == A_M_LYRLIST || a == A_NT_AREA; }
+static bool IsBackgroundAct(int a) { return a == A_AL_LIST || a == A_HALF_ROW || a == A_N_LIST || a == A_CL_LIST || a == A_M_LYRLIST || a == A_NT_AREA; }
 
 static const Hit* HitAt(D2D1_POINT_2F p, bool includeBackground = true) {
     for (int pass = 0; pass < 2; pass++) {
@@ -2519,11 +3037,18 @@ static bool InIsland(D2D1_POINT_2F p) {
     return p.x >= g_islandRect.left && p.x < g_islandRect.right && p.y >= 0 && p.y < std::max(6.0f, g_islandRect.bottom);
 }
 
-static void CloseAll() {
+static void ApplyTimerEdit(bool start);
+static void ApplyAlarmEdit();
+static void CloseFull() {  // the half view stays (it's always pinned)
+    if (U.timerEdit) ApplyTimerEdit(false);
+    if (U.alarmEdit) ApplyAlarmEdit();
     U.expanded = false;
-    U.halfOn = false;
     U.noteFocus = false;
     Wake();
+}
+static void CloseAll() {
+    CloseFull();
+    U.halfOn = false;
 }
 
 // ---- notifications ----
@@ -2540,6 +3065,10 @@ static void ShowPopup(const Notif& n) {
 static void AddNotification(Notif n, bool force = false) {
     g_now = NowMs();
     int rule = force ? 0 : RuleFor(n.app);
+    if (g_set.hideBanners && !n.aumid.empty() && !g_bannerBackup.count(n.aumid)) {
+        HideBannerFor(n.aumid);
+        SaveBannerBackup();
+    }
     if (rule == 2) return;
     U.list.insert(U.list.begin(), n);
     if (U.list.size() > 30) U.list.resize(30);
@@ -2562,8 +3091,9 @@ static void InternalNotify(const wstring& title, const wstring& body) {
     MessageBeep(MB_ICONASTERISK);
 }
 
-static void OpenApp(const wstring& aumid) {
+static void OpenApp(const wstring& aumid, const wstring& title = L"") {
     if (aumid.empty()) return;
+    if (ActivateAppWindow(aumid, L"", title)) return;  // already open: bring it forward
     wstring target = L"shell:AppsFolder\\" + aumid;
     ShellExecuteW(nullptr, L"open", target.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
@@ -2624,70 +3154,194 @@ static void NoteChanged() {
     SetTimer(g_hwnd, TM_SAVE, 600, nullptr);
     Wake();
 }
+struct NPos {
+    int l, c;
+};
+static bool operator<(NPos a, NPos b) { return a.l < b.l || (a.l == b.l && a.c < b.c); }
+static bool operator==(NPos a, NPos b) { return a.l == b.l && a.c == b.c; }
+static bool IsRule(int l) { return U.note[l] == L"---"; }
+static int LineLen(int l) { return IsRule(l) ? 1 : (int)U.note[l].size(); }
+static NPos CaretPos() { return {U.cLine, U.cCol}; }
+static NPos AnchorPos() { return {U.aLine, U.aCol}; }
+static bool HasSel() { return !(CaretPos() == AnchorPos()); }
+static void SelRange(NPos& a, NPos& b) {
+    a = AnchorPos();
+    b = CaretPos();
+    if (b < a) std::swap(a, b);
+}
+static void SetCaret(NPos p, bool extend) {
+    p.l = std::clamp(p.l, 0, (int)U.note.size() - 1);
+    p.c = std::clamp(p.c, 0, LineLen(p.l));
+    U.cLine = p.l;
+    U.cCol = p.c;
+    if (!extend) { U.aLine = p.l; U.aCol = p.c; }
+    U.caretAt = NowMs();
+}
+
+// Undo: snapshots; typing (or deleting) in a burst is one step.
+struct NoteSnap {
+    std::vector<wstring> note;
+    int cl, cc, al, ac;
+};
+static std::vector<NoteSnap> g_undo, g_redo;
+static int g_lastEditKind = 0;
+static ULONGLONG g_lastEditAt = 0;
+static NoteSnap Snap() { return {U.note, U.cLine, U.cCol, U.aLine, U.aCol}; }
+static void Restore(const NoteSnap& s) {
+    U.note = s.note;
+    if (U.note.empty()) U.note.push_back(L"");
+    U.aLine = s.al;
+    U.aCol = s.ac;
+    SetCaret({s.cl, s.cc}, true);
+}
+static void PushUndo(int kind) {  // kind: 1 typing, 2 deleting, 0 anything else
+    ULONGLONG t = NowMs();
+    if (kind && kind == g_lastEditKind && t - g_lastEditAt < 1200) { g_lastEditAt = t; return; }
+    g_undo.push_back(Snap());
+    if (g_undo.size() > 200) g_undo.erase(g_undo.begin());
+    g_redo.clear();
+    g_lastEditKind = kind;
+    g_lastEditAt = t;
+}
+
+static wstring PrefixOf(int l, int c) { return IsRule(l) ? (c ? L"---" : L"") : U.note[l].substr(0, c); }
+static wstring SuffixOf(int l, int c) { return IsRule(l) ? (c ? L"" : L"---") : U.note[l].substr(c); }
+
+static wstring TextRange(NPos a, NPos b) {
+    wstring out;
+    for (int l = a.l; l <= b.l; l++) {
+        int s = l == a.l ? a.c : 0, e = l == b.l ? b.c : LineLen(l);
+        if (IsRule(l)) out += s < e ? L"———" : L"";
+        else out += U.note[l].substr(s, e - s);
+        if (l < b.l) out += L"\r\n";
+    }
+    return out;
+}
+static void DeleteRange(NPos a, NPos b) {
+    if (!(a < b)) return;
+    // Joining a line onto a rule (or a rule onto a line) removes the rule instead.
+    if (IsRule(a.l) && a.c == 1 && b.l > a.l) a.c = 0;
+    if (IsRule(b.l) && b.c == 0 && a.l < b.l) b.c = 1;
+    wstring merged = PrefixOf(a.l, a.c) + SuffixOf(b.l, b.c);
+    U.note.erase(U.note.begin() + a.l + 1, U.note.begin() + b.l + 1);
+    U.note[a.l] = merged;
+    SetCaret(a, false);
+}
+static void DeleteSel() {
+    if (!HasSel()) return;
+    NPos a, b;
+    SelRange(a, b);
+    DeleteRange(a, b);
+}
+
 static void NoteInsertText(const wstring& t) {
+    DeleteSel();
     for (wchar_t c : t) {
         if (c == L'\r') continue;
         if (c == L'\n') {
-            wstring& line = U.note[U.cLine];
-            wstring rest = line == L"---" ? L"" : line.substr(std::min<size_t>(U.cCol, line.size()));
-            if (line != L"---") line.erase(std::min<size_t>(U.cCol, line.size()));
+            wstring rest = SuffixOf(U.cLine, U.cCol);
+            U.note[U.cLine] = PrefixOf(U.cLine, U.cCol);
             U.note.insert(U.note.begin() + U.cLine + 1, rest);
             U.cLine++;
             U.cCol = 0;
         } else if (c >= 32 || c == L'\t') {
-            if (U.note[U.cLine] == L"---") {  // typing on a rule starts a new line under it
-                U.note.insert(U.note.begin() + U.cLine + 1, L"");
-                U.cLine++;
+            if (IsRule(U.cLine)) {  // typing on a rule starts a line next to it
+                int at = U.cCol ? U.cLine + 1 : U.cLine;
+                U.note.insert(U.note.begin() + at, L"");
+                U.cLine = at;
                 U.cCol = 0;
             }
-            U.note[U.cLine].insert(std::min<size_t>(U.cCol, U.note[U.cLine].size()), 1, c);
+            if (c == L'\t') { U.note[U.cLine].insert(U.cCol, L"    "); U.cCol += 4; continue; }
+            U.note[U.cLine].insert(U.note[U.cLine].begin() + U.cCol, c);
             U.cCol++;
         }
     }
+    SetCaret(CaretPos(), false);
+    U.prefCol = -1;
     NoteChanged();
 }
+
+static bool IsWordChar(wchar_t c) { return iswalnum(c) || c == L'_' || c > 0x7F; }
+static NPos PrevChar(NPos p) { return p.c > 0 ? NPos{p.l, p.c - 1} : p.l > 0 ? NPos{p.l - 1, LineLen(p.l - 1)} : p; }
+static NPos NextChar(NPos p) { return p.c < LineLen(p.l) ? NPos{p.l, p.c + 1} : p.l + 1 < (int)U.note.size() ? NPos{p.l + 1, 0} : p; }
+static NPos WordLeft(NPos p) {
+    if (p.c == 0 || IsRule(p.l)) return PrevChar(p);
+    const wstring& s = U.note[p.l];
+    int i = p.c;
+    while (i > 0 && iswspace(s[i - 1])) i--;
+    if (i > 0) {
+        bool w = IsWordChar(s[i - 1]);
+        while (i > 0 && !iswspace(s[i - 1]) && IsWordChar(s[i - 1]) == w) i--;
+    }
+    return {p.l, i};
+}
+static NPos WordRight(NPos p) {
+    if (p.c >= LineLen(p.l) || IsRule(p.l)) return NextChar(p);
+    const wstring& s = U.note[p.l];
+    int i = p.c, n = (int)s.size();
+    bool w = IsWordChar(s[i]);
+    while (i < n && !iswspace(s[i]) && IsWordChar(s[i]) == w) i++;
+    while (i < n && iswspace(s[i])) i++;
+    return {p.l, i};
+}
+
 static void NoteKey(WPARAM vk) {
-    bool ctrl = GetKeyState(VK_CONTROL) < 0;
-    wstring& line = U.note[U.cLine];
-    int len = line == L"---" ? 1 : (int)line.size();
+    bool ctrl = GetKeyState(VK_CONTROL) < 0, shift = GetKeyState(VK_SHIFT) < 0;
+    NPos c = CaretPos(), a, b;
+    SelRange(a, b);
+    int last = (int)U.note.size() - 1;
+    auto vertical = [&](int dl) {
+        if (U.prefCol < 0) U.prefCol = U.cCol;
+        int l = std::clamp(U.cLine + dl, 0, last);
+        NPos t = l == U.cLine ? NPos{l, dl < 0 ? 0 : LineLen(l)} : NPos{l, std::min(U.prefCol, LineLen(l))};
+        int keep = U.prefCol;
+        SetCaret(t, shift);
+        U.prefCol = keep;
+    };
     switch (vk) {
         case VK_LEFT:
-            if (U.cCol > 0) U.cCol--;
-            else if (U.cLine > 0) { U.cLine--; U.cCol = U.note[U.cLine] == L"---" ? 1 : (int)U.note[U.cLine].size(); }
+            if (HasSel() && !shift) SetCaret(a, false);
+            else SetCaret(ctrl ? WordLeft(c) : PrevChar(c), shift);
+            U.prefCol = -1;
             break;
         case VK_RIGHT:
-            if (U.cCol < len) U.cCol++;
-            else if (U.cLine + 1 < (int)U.note.size()) { U.cLine++; U.cCol = 0; }
+            if (HasSel() && !shift) SetCaret(b, false);
+            else SetCaret(ctrl ? WordRight(c) : NextChar(c), shift);
+            U.prefCol = -1;
             break;
-        case VK_UP:
-            if (U.cLine > 0) { U.cLine--; U.cCol = std::min<int>(U.cCol, U.note[U.cLine] == L"---" ? 1 : (int)U.note[U.cLine].size()); }
-            break;
-        case VK_DOWN:
-            if (U.cLine + 1 < (int)U.note.size()) { U.cLine++; U.cCol = std::min<int>(U.cCol, U.note[U.cLine] == L"---" ? 1 : (int)U.note[U.cLine].size()); }
-            break;
-        case VK_HOME: U.cCol = 0; break;
-        case VK_END: U.cCol = len; break;
+        case VK_UP: vertical(-1); break;
+        case VK_DOWN: vertical(1); break;
+        case VK_PRIOR: vertical(-4); break;
+        case VK_NEXT: vertical(4); break;
+        case VK_HOME: SetCaret(ctrl ? NPos{0, 0} : NPos{c.l, 0}, shift); U.prefCol = -1; break;
+        case VK_END: SetCaret(ctrl ? NPos{last, LineLen(last)} : NPos{c.l, LineLen(c.l)}, shift); U.prefCol = -1; break;
         case VK_BACK:
-            if (line == L"---") { U.note.erase(U.note.begin() + U.cLine); if (U.cLine > 0) U.cLine--; U.cCol = (int)U.note[U.cLine].size(); }
-            else if (U.cCol > 0) { line.erase(U.cCol - 1, 1); U.cCol--; }
-            else if (U.cLine > 0) {
-                wstring cur = line;
-                U.note.erase(U.note.begin() + U.cLine);
-                U.cLine--;
-                if (U.note[U.cLine] == L"---") { U.note[U.cLine] = cur; U.cCol = 0; }
-                else { U.cCol = (int)U.note[U.cLine].size(); U.note[U.cLine] += cur; }
-            }
+            PushUndo(2);
+            if (HasSel()) DeleteSel();
+            else DeleteRange(ctrl ? WordLeft(c) : PrevChar(c), c);
+            U.prefCol = -1;
             NoteChanged();
             break;
         case VK_DELETE:
-            if (line == L"---") { U.note.erase(U.note.begin() + U.cLine); if (U.note.empty()) U.note.push_back(L""); U.cLine = std::min<int>(U.cLine, (int)U.note.size() - 1); U.cCol = 0; }
-            else if (U.cCol < (int)line.size()) line.erase(U.cCol, 1);
-            else if (U.cLine + 1 < (int)U.note.size()) {
-                wstring next = U.note[U.cLine + 1];
-                U.note.erase(U.note.begin() + U.cLine + 1);
-                if (next != L"---") line += next;
-            }
+            PushUndo(2);
+            if (HasSel()) DeleteSel();
+            else DeleteRange(c, ctrl ? WordRight(c) : NextChar(c));
+            U.prefCol = -1;
             NoteChanged();
+            break;
+        case 'A':
+            if (ctrl) { U.aLine = 0; U.aCol = 0; SetCaret({last, LineLen(last)}, true); }
+            break;
+        case 'C':
+            if (ctrl && HasSel()) SetClipboardText(TextRange(a, b));
+            break;
+        case 'X':
+            if (ctrl && HasSel()) {
+                SetClipboardText(TextRange(a, b));
+                PushUndo(0);
+                DeleteSel();
+                NoteChanged();
+            }
             break;
         case 'V':
             if (ctrl && OpenClipboard(g_hwnd)) {
@@ -2696,41 +3350,76 @@ static void NoteKey(WPARAM vk) {
                     if (auto p = (const wchar_t*)GlobalLock(h)) { t = p; GlobalUnlock(h); }
                 }
                 CloseClipboard();
+                PushUndo(0);
                 NoteInsertText(t);
             }
             break;
-        case 'C':
-            if (ctrl) SetClipboardText(NoteJoined(true));
+        case 'Z':
+        case 'Y':
+            if (ctrl) {
+                bool redo = vk == 'Y' || shift;
+                auto& from = redo ? g_redo : g_undo;
+                auto& to = redo ? g_undo : g_redo;
+                if (!from.empty()) {
+                    to.push_back(Snap());
+                    Restore(from.back());
+                    from.pop_back();
+                    g_lastEditKind = 0;
+                    NoteChanged();
+                }
+            }
             break;
         case VK_ESCAPE:
-            U.noteFocus = false;
+            if (HasSel()) SetCaret(c, false);
+            else U.noteFocus = false;
             break;
     }
     if (U.note.empty()) U.note.push_back(L"");
-    U.cLine = std::clamp(U.cLine, 0, (int)U.note.size() - 1);
     Wake();
 }
-// Place the caret where the note was clicked.
-static void NoteClick(D2D1_POINT_2F p, const D2D1_RECT_F& area) {
+
+// Where in the note a point is (for clicks and drags).
+static NPos NotePosAt(D2D1_POINT_2F p, const D2D1_RECT_F& area) {
     float iw = (area.right - area.left) - NOTE_PAD * 2;
     float y = area.top + 7 - U.noteScroll;
     for (size_t i = 0; i < U.note.size(); i++) {
         float lh = NoteLineHeight(U.note[i], iw);
         if (p.y < y + lh || i + 1 == U.note.size()) {
-            U.cLine = (int)i;
-            if (U.note[i] == L"---") U.cCol = p.x > (area.left + area.right) / 2 ? 1 : 0;
-            else if (IDWriteTextLayout* l = NoteLayout(U.note[i], iw)) {
+            if (IsRule((int)i)) return {(int)i, p.x > (area.left + area.right) / 2 ? 1 : 0};
+            int col = (int)U.note[i].size();
+            if (IDWriteTextLayout* l = NoteLayout(U.note[i], iw)) {
                 BOOL trailing = FALSE, inside = FALSE;
                 DWRITE_HIT_TEST_METRICS hm{};
                 l->HitTestPoint(p.x - area.left - NOTE_PAD, p.y - y, &trailing, &inside, &hm);
-                U.cCol = std::min<int>((int)U.note[i].size(), (int)hm.textPosition + (trailing ? 1 : 0));
+                col = std::min<int>((int)U.note[i].size(), (int)hm.textPosition + (trailing ? 1 : 0));
                 l->Release();
             }
-            break;
+            return {(int)i, col};
         }
         y += lh;
     }
+    return {0, 0};
 }
+static void NoteClick(D2D1_POINT_2F p, const D2D1_RECT_F& area) { SetCaret(NotePosAt(p, area), GetKeyState(VK_SHIFT) < 0); }
+static void NoteSelectWord(D2D1_POINT_2F p, const D2D1_RECT_F& area) {
+    NPos q = NotePosAt(p, area);
+    if (IsRule(q.l)) { U.aLine = q.l; U.aCol = 0; SetCaret({q.l, 1}, true); return; }
+    const wstring& s = U.note[q.l];
+    int i = std::min<int>(q.c, (int)s.size()), j = i;
+    if (i < (int)s.size() || i > 0) {
+        int k = i < (int)s.size() ? i : i - 1;
+        bool w = IsWordChar(s[k]);
+        i = k;
+        j = k + 1;
+        while (i > 0 && IsWordChar(s[i - 1]) == w && !iswspace(s[i - 1]) == !iswspace(s[k])) i--;
+        while (j < (int)s.size() && IsWordChar(s[j]) == w && !iswspace(s[j]) == !iswspace(s[k])) j++;
+    }
+    U.aLine = q.l;
+    U.aCol = i;
+    SetCaret({q.l, j}, true);
+}
+static bool g_noteDrag = false;
+static D2D1_RECT_F g_noteArea{};
 
 // ---- shelf ----
 
@@ -2785,7 +3474,6 @@ class DropTarget : public IDropTarget {
             U.dropping = true;
             U.openedByDrop = !U.expanded;
             U.expanded = true;
-            U.halfOn = false;
             U.tab = T_SHELF;
             Wake();
         }
@@ -2850,17 +3538,53 @@ static void ToggleStopwatch() {
 
 // ---- clicks ----
 
-static void SeekFromX(float x, const D2D1_RECT_F& r) {
+static void SeekFromX(float x, const D2D1_RECT_F& r, bool commit = true) {
     Media m = MediaSnapshot(false);
     if (m.durMs <= 0) return;
     float frac = std::clamp((x - r.left - 6) / std::max(1.0f, r.right - r.left - 12), 0.0f, 1.0f);
-    SendMediaCommand(MediaCmd::Seek, (long long)(frac * m.durMs));
+    long long ms = (long long)(frac * m.durMs);
+    if (commit) SendMediaCommand(MediaCmd::Seek, ms);
+    else {  // dragging: just move the bar; the app seeks once, on release
+        std::lock_guard<std::mutex> lk(g_mx);
+        g_media.posMs = ms;
+        g_media.sampledAt = QpcSeconds();
+        g_seekTarget = ms;
+        g_seekHoldUntil = QpcSeconds() + 1.5;
+    }
+    Wake();
 }
-static void LevelFromX(float x, const D2D1_RECT_F& r, int kind) {
-    if (kind != 0) return;  // brightness is read-only in v1
-    float frac = std::clamp((x - r.left - 6) / std::max(1.0f, r.right - r.left - 12), 0.0f, 1.0f);
-    SetVolume((int)std::lround(frac * 100));
-    U.vol = (int)std::lround(frac * 100);
+// Alarms: the add row's time, typed as four digits ("0730") or scrolled.
+static void ApplyAlarmEdit() {
+    if (!U.alarmEdit) return;
+    U.alarmEdit = false;
+    if (U.alarmBuf.size() >= 3) {
+        int v = _wtoi(U.alarmBuf.c_str());
+        int hh = v / 100, mm = v % 100;
+        if (hh <= 23 && mm <= 59) U.newAlarm = hh * 60 + mm;
+    }
+    U.alarmBuf.clear();
+}
+static void AddAlarm() {
+    ApplyAlarmEdit();
+    AlarmCfg a;
+    a.hour = U.newAlarm / 60;
+    a.minute = U.newAlarm % 60;
+    a.label = L"Alarm";
+    a.enabled = true;
+    U.alarms.push_back(a);
+    std::sort(U.alarms.begin(), U.alarms.end(), [](const AlarmCfg& x, const AlarmCfg& y) { return x.hour * 60 + x.minute < y.hour * 60 + y.minute; });
+    SaveUiValues();
+}
+// Typed timer: digits fill from the right ("530" = 5:30).
+static void ApplyTimerEdit(bool start) {
+    if (!U.timerEdit) return;
+    U.timerEdit = false;
+    if (U.timerBuf.empty()) return;
+    int v = _wtoi(U.timerBuf.c_str());
+    int secs = (v / 100) * 60 + (v % 100);
+    U.timerSet = std::clamp(secs, 1, 999 * 60 + 59);
+    U.timerBuf.clear();
+    if (start) StartTimer();
 }
 
 static void DoAction(const Hit& h, D2D1_POINT_2F p) {
@@ -2876,7 +3600,7 @@ static void DoAction(const Hit& h, D2D1_POINT_2F p) {
                 wstring a = U.list[h.arg].aumid;
                 U.list.erase(U.list.begin() + h.arg);
                 OpenApp(a);
-                if (!U.pinned) CloseAll();
+                if (!U.pinned) CloseFull();
             }
             break;
         case A_N_REMOVE: if (h.arg < (int)U.list.size()) U.list.erase(U.list.begin() + h.arg); break;
@@ -2887,27 +3611,65 @@ static void DoAction(const Hit& h, D2D1_POINT_2F p) {
         case A_M_LYRICS: U.lyricsOpen = !U.lyricsOpen; U.lastLyric = -2; SaveUiValues(); break;
         case A_M_SEEKBAR: SeekFromX(p.x, h.r); break;
         case A_M_LINE: {
+            // Jump there: the line lights up and the list glides to it at once; the app's audio fades
+            // out and back in around the jump (see FadeSessions).
             Media m = MediaSnapshot(true);
-            if (h.arg < (int)m.lyrics.size() && m.lyrics[h.arg].ms >= 0) SendMediaCommand(MediaCmd::Seek, m.lyrics[h.arg].ms);
+            if (h.arg < (int)m.lyrics.size() && m.lyrics[h.arg].ms >= 0) SendMediaCommand(MediaCmd::Seek, m.lyrics[h.arg].ms + 30);
             U.lyrUserScrolled = false;
+            U.lyrJumpAt = NowMs();
             break;
         }
         case A_M_SOURCE: {
+            // The app (or browser window) that's playing: a browser tab is found by the song in its title.
             Media m = MediaSnapshot(false);
-            OpenApp(m.aumid);
-            if (!U.pinned) CloseAll();
+            if (ActivateAppWindow(m.aumid, L"", m.title)) SelectBrowserTab(g_lastActivated, m.title);  // the playing tab, in a browser
+            else OpenApp(m.aumid);
+            if (!U.pinned) CloseFull();
             break;
         }
+        case A_H_MIC: case A_ACT_MUTE:
+            SetMicMuted(!U.micMuted);
+            U.micMuted = MicMuted();
+            break;
+        case A_ACT_SHOW:
+            if (h.arg < (int)U.micUsers.size()) {
+                wstring stem = ToLower(U.micUsers[h.arg].name);
+                ActivateAppWindow(L"", stem, L"");
+                if (!U.pinned) CloseFull();
+            }
+            break;
+        case A_ACT_DL:
+            if (!U.dlFolder.empty()) ShellExecuteW(nullptr, L"open", U.dlFolder.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            break;
+        case A_ACT_COPY:
+            if (h.arg < (int)U.copies.size()) SetForegroundWindow(U.copies[h.arg].hwnd);
+            break;
         case A_C_MODE: U.cmode = (ClockMode)h.arg; break;
         case A_T_MINUS: U.timerSet = std::max(0, U.timerSet - 60); break;
         case A_T_PLUS: U.timerSet = std::min(999 * 60 + 59, U.timerSet + 60); break;
-        case A_T_PRESET: U.timerSet = h.arg * 60; break;
-        case A_T_START: StartTimer(); break;
+        case A_T_PRESET: U.timerSet = h.arg * 60; U.timerEdit = false; break;
+        case A_T_DIGITS:
+            U.timerEdit = true;
+            U.timerBuf.clear();
+            SetForegroundWindow(g_hwnd);
+            SetFocus(g_hwnd);
+            break;
+        case A_T_START: if (U.timerEdit) ApplyTimerEdit(true); else StartTimer(); break;
         case A_T_PAUSE: case A_H_TIMER: ToggleTimerPause(); break;
         case A_T_CANCEL: U.timerRun = false; break;
         case A_AL_TOGGLE:
-            if (h.arg < (int)U.alarmOn.size()) U.alarmOn[h.arg] = !U.alarmOn[h.arg];
+            if (h.arg < (int)U.alarms.size()) { U.alarms[h.arg].enabled = !U.alarms[h.arg].enabled; SaveUiValues(); }
             break;
+        case A_AL_REMOVE:
+            if (h.arg < (int)U.alarms.size()) { U.alarms.erase(U.alarms.begin() + h.arg); SaveUiValues(); }
+            break;
+        case A_AL_TIME:
+            U.alarmEdit = true;
+            U.alarmBuf.clear();
+            SetForegroundWindow(g_hwnd);
+            SetFocus(g_hwnd);
+            break;
+        case A_AL_ADD: AddAlarm(); break;
         case A_SW_GO: case A_H_SW: ToggleStopwatch(); break;
         case A_SW_LAP:
             if (U.swRun) U.laps.insert(U.laps.begin(), StopwatchMs());
@@ -2929,19 +3691,20 @@ static void DoAction(const Hit& h, D2D1_POINT_2F p) {
             break;
         case A_CL_REMOVE: if (h.arg < (int)U.clips.size()) U.clips.erase(U.clips.begin() + h.arg); break;
         case A_CL_CLEAR: U.clips.clear(); break;
-        case A_NT_AREA:
+        case A_NT_AREA:  // (the click itself is handled on press, so dragging can select)
             U.noteFocus = true;
-            NoteClick(p, h.r);
             SetForegroundWindow(g_hwnd);
             SetFocus(g_hwnd);
             break;
         case A_NT_LINE: {
             // A rule under the caret's line, then a fresh line to keep typing on.
+            PushUndo(0);
             int at = std::clamp(U.cLine, 0, (int)U.note.size() - 1);
             bool emptyNote = U.note.size() == 1 && U.note[0].empty();
             if (emptyNote) { U.note[0] = L"---"; U.note.push_back(L""); U.cLine = 1; }
             else { U.note.insert(U.note.begin() + at + 1, L"---"); U.note.insert(U.note.begin() + at + 2, L""); U.cLine = at + 2; }
             U.cCol = 0;
+            SetCaret(CaretPos(), false);
             U.noteFocus = true;
             SetForegroundWindow(g_hwnd);
             SetFocus(g_hwnd);
@@ -2949,8 +3712,7 @@ static void DoAction(const Hit& h, D2D1_POINT_2F p) {
             break;
         }
         case A_NT_COPY: SetClipboardText(NoteJoined(true)); break;
-        case A_NT_CLEAR: U.note = {L""}; U.cLine = U.cCol = 0; NoteChanged(); break;
-        case A_LEVEL: LevelFromX(p.x, h.r, h.arg); break;
+        case A_NT_CLEAR: PushUndo(0); U.note = {L""}; SetCaret({0, 0}, false); NoteChanged(); break;
         default: break;
     }
     Wake();
@@ -2964,13 +3726,14 @@ static void OnLeftClick(D2D1_POINT_2F p) {
     if (v == V_NOTIF) {  // the pop-up: open the Notifications tab with it at the top
         U.tab = T_ALERTS;
         U.expanded = true;
-        U.halfOn = false;
         U.popActive = false;
         SaveUiValues();
         Wake();
         return;
     }
     if (v == V_EXP) {
+        if (U.timerEdit && (!h || (h->act != A_T_DIGITS && h->act != A_T_START))) ApplyTimerEdit(false);
+        if (U.alarmEdit && (!h || (h->act != A_AL_TIME && h->act != A_AL_ADD))) ApplyAlarmEdit();
         if (h) DoAction(*h, p);
         if (!h || h->act != A_NT_AREA) {
             if (U.noteFocus && (!h || (h->act != A_NT_LINE))) U.noteFocus = false;
@@ -2979,19 +3742,16 @@ static void OnLeftClick(D2D1_POINT_2F p) {
         return;
     }
     if (v == V_HALF) {
-        if (h && (h->act == A_H_TIMER || h->act == A_H_SW || h->act == A_H_PLAY)) { DoAction(*h, p); return; }
+        if (h && (h->act == A_H_TIMER || h->act == A_H_SW || h->act == A_H_PLAY || h->act == A_H_MIC)) { DoAction(*h, p); return; }
         if (h && h->act == A_CHIP) U.tab = (Tab)h->arg;
-        U.expanded = true;
-        U.halfOn = false;
+        U.expanded = true;  // the half view stays underneath and comes back when the full view closes
         U.ducking = false;
         SaveUiValues();
         Wake();
         return;
     }
-    if (v == V_LEVEL && h && h->act == A_LEVEL) { DoAction(*h, p); return; }
     // the bar, or hidden
     U.expanded = true;
-    U.levelUntil = 0;
     Wake();
 }
 
@@ -3001,8 +3761,7 @@ static void OnRightClick() {
     switch (v) {
         case V_AUTH: return;
         case V_NOTIF: U.popActive = false; break;  // dismiss only; it stays in the list
-        case V_LEVEL: U.levelUntil = 0; break;
-        case V_EXP: U.expanded = false; U.halfOn = HalfHasContent(); U.noteFocus = false; break;
+        case V_EXP: CloseFull(); U.halfOn = HalfHasContent(); break;
         case V_HALF: U.halfOn = false; U.ducking = false; break;
         default:
             if (HalfHasContent()) U.halfOn = true;
@@ -3014,16 +3773,9 @@ static void OnRightClick() {
 static void OnWheel(D2D1_POINT_2F p, int delta, bool horizontal) {
     const Hit* h = HitAt(p);
     float d = -delta / 120.0f;
-    View v = CurrentView();
-    if (v == V_LEVEL || (h && h->act == A_LEVEL)) {
-        if (U.levelKind == 0) { SetVolume(U.vol + (delta > 0 ? 2 : -2)); U.vol = GetVolume(&U.muted); }
-        U.levelUntil = U.levelUntil > g_now ? NowMs() + 1600 : U.levelUntil;
-        Wake();
-        return;
-    }
     if (!h) return;
     switch (h->act) {
-        case A_HALF_ROW: case A_CHIP: case A_H_PLAY: case A_H_SW: case A_H_TIMER: U.halfScroll += d * 40; break;
+        case A_HALF_ROW: case A_CHIP: case A_H_PLAY: case A_H_SW: case A_H_TIMER: case A_H_MIC: U.halfScroll += d * 40; break;
         case A_N_LIST: case A_N_OPEN: case A_N_REMOVE: U.alertsScroll += d * 24; break;
         case A_CL_LIST: case A_CL_COPY: case A_CL_REMOVE: U.clipScroll += d * 28; break;
         case A_M_LYRLIST: case A_M_LINE: U.lyrScroll.v += d * 26; U.lyrScroll.vel = 0; U.lyrUserScrolled = true; break;
@@ -3033,7 +3785,15 @@ static void OnWheel(D2D1_POINT_2F p, int delta, bool horizontal) {
             SendMediaCommand(MediaCmd::Seek, std::max(0LL, m.posMs + (delta > 0 ? 5000 : -5000)));
             break;
         }
+        case A_AL_LIST: case A_AL_TOGGLE: case A_AL_REMOVE: U.alarmScroll += d * 24; break;
+        case A_AL_TIME: {
+            if (U.alarmEdit) break;
+            bool hours = p.x < (h->r.left + h->r.right) / 2;
+            U.newAlarm = ((U.newAlarm + (delta > 0 ? 1 : -1) * (hours ? 60 : 5)) % 1440 + 1440) % 1440;
+            break;
+        }
         case A_T_DIGITS: {
+            if (U.timerEdit) break;
             bool minutes = p.x < (h->r.left + h->r.right) / 2;
             U.timerSet = std::clamp(U.timerSet + (delta > 0 ? 1 : -1) * (minutes ? 60 : 5), 0, 999 * 60 + 59);
             break;
@@ -3146,13 +3906,14 @@ static LRESULT CALLBACK KeyboardProc(int code, WPARAM wp, LPARAM lp) {
 static LRESULT CALLBACK MouseProc(int code, WPARAM wp, LPARAM lp) {
     if (code == HC_ACTION && (wp == WM_LBUTTONDOWN || wp == WM_RBUTTONDOWN || wp == WM_MBUTTONDOWN)) {
         auto* m = (MSLLHOOKSTRUCT*)lp;
-        if (WindowFromPoint(m->pt) != g_hwnd) PostToUi(WM_ISLAND_CLICKOFF);
+        // Judge by the island's own shape: the window around it is mostly transparent.
+        if (!InIsland(ScreenToCanvas(m->pt))) PostToUi(WM_ISLAND_CLICKOFF);
     }
     return CallNextHookEx(nullptr, code, wp, lp);
 }
 
 static void InstallMouseHookIfNeeded() {
-    bool want = (U.expanded || U.halfOn) && !U.pinned && !Ghosted() && !U.dropping;
+    bool want = U.expanded && !U.pinned && !Ghosted() && !U.dropping;  // the half view is always pinned
     if (want && !g_mouseHook) g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseProc, GetModuleHandleW(nullptr), 0);
     else if (!want && g_mouseHook) { UnhookWindowsHookEx(g_mouseHook); g_mouseHook = nullptr; }
 }
@@ -3204,9 +3965,9 @@ static void SlowTick() {
     int minuteKey = st.wHour * 60 + st.wMinute;
     if (minuteKey != U.lastAlarmMinute) {
         U.lastAlarmMinute = minuteKey;
-        for (size_t i = 0; i < g_set.alarms.size(); i++) {
-            auto& a = g_set.alarms[i];
-            if (i < U.alarmOn.size() && U.alarmOn[i] && a.hour == st.wHour && a.minute == st.wMinute) {
+        for (size_t i = 0; i < U.alarms.size(); i++) {
+            auto& a = U.alarms[i];
+            if (a.enabled && a.hour == st.wHour && a.minute == st.wMinute) {
                 SYSTEMTIME at{};
                 at.wHour = (WORD)a.hour;
                 at.wMinute = (WORD)a.minute;
@@ -3237,12 +3998,84 @@ static void SlowTick() {
         if (dnd) U.dndHeld = 0;
         Wake();
     }
-    bool mic = CapabilityInUse(L"microphone"), cam = CapabilityInUse(L"webcam");
-    if (mic != U.mic || cam != U.cam) { U.mic = mic; U.cam = cam; Wake(); }
+    // Apps using the microphone (a call, usually) and the camera.
+    auto micUsers = CapabilityUsers(L"microphone");
+    bool cam = !CapabilityUsers(L"webcam").empty();
+    bool started = micUsers.size() > U.micUsers.size();
+    if (micUsers.size() != U.micUsers.size() || cam != U.cam) Wake();
+    U.micUsers = std::move(micUsers);
+    U.mic = !U.micUsers.empty();
+    U.cam = cam;
+    if (U.mic) U.micMuted = MicMuted();
+    // Downloads in progress (partial files in the Downloads folder).
+    if (!U.dlFolder.empty()) {
+        std::vector<Download> now;
+        WIN32_FIND_DATAW fd;
+        HANDLE f = FindFirstFileW((U.dlFolder + L"\\*").c_str(), &fd);
+        if (f != INVALID_HANDLE_VALUE) {
+            do {
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                wstring finalName;
+                if (!IsPartialDownload(fd.cFileName, finalName)) continue;
+                Download d;
+                d.path = U.dlFolder + L"\\" + fd.cFileName;
+                d.name = finalName;
+                d.size = ((long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+                d.since = g_now;
+                for (auto& o : U.downloads)
+                    if (o.path == d.path) {
+                        d.since = o.since;
+                        d.speed = o.speed * 0.5 + std::max(0LL, d.size - o.size) * 0.5;
+                    }
+                now.push_back(d);
+            } while (FindNextFileW(f, &fd));
+            FindClose(f);
+        }
+        for (auto& o : U.downloads) {  // finished (or cancelled)?
+            bool still = false;
+            for (auto& d : now) still |= d.path == o.path;
+            if (!still && o.name != L"Download" && GetFileAttributesW((U.dlFolder + L"\\" + o.name).c_str()) != INVALID_FILE_ATTRIBUTES) {
+                Notif n;
+                n.app = L"Downloads";
+                n.title = L"Download finished";
+                n.body = o.name;
+                GetLocalTime(&n.at);
+                AddNotification(n, true);
+            }
+        }
+        started |= now.size() > U.downloads.size();
+        if (now.size() != U.downloads.size()) Wake();
+        U.downloads = std::move(now);
+    }
+    // File Explorer copy/move dialogs.
+    {
+        std::vector<CopyOp> now;
+        EnumWindows(FindCopyProc, (LPARAM)&now);
+        for (auto& c : now)
+            for (auto& o : U.copies)
+                if (o.hwnd == c.hwnd) c.since = o.since;
+        for (auto& c : now)
+            if (!c.since) c.since = g_now;
+        for (auto& o : U.copies) {
+            bool still = false;
+            for (auto& c : now) still |= c.hwnd == o.hwnd;
+            if (!still && g_now - o.since > 2000) {
+                Notif n;
+                n.app = L"File Explorer";
+                n.title = L"Copy finished";
+                GetLocalTime(&n.at);
+                AddNotification(n, true);
+            }
+        }
+        started |= now.size() > U.copies.size();
+        if (now.size() != U.copies.size()) Wake();
+        U.copies = std::move(now);
+    }
+    if (started && g_set.autoHalf && !U.expanded && !U.halfOn && !U.fullscreen) { U.halfOn = true; Wake(); }
     // Stay above other topmost windows (unless something is full screen).
     if (!U.fullscreen) SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     View v = CurrentView();
-    if (v == V_HALF || v == V_LINE || (v == V_EXP && (U.tab == T_CLOCK || U.tab == T_MUSIC || U.tab == T_ALERTS || U.tab == T_CLIP))) Wake();
+    if (v == V_HALF || v == V_LINE || (v == V_EXP && U.tab != T_SHELF)) Wake();
 }
 
 static void RegisterHotkeys() {
@@ -3263,6 +4096,13 @@ static void SaveUiValues() {
     wstring shelf;
     for (auto& p : U.shelf) shelf += p + L"\n";
     SaveValue(L"shelf", shelf);
+    wstring al;
+    for (auto& a : U.alarms) {
+        wchar_t b[32];
+        swprintf_s(b, L"%02d:%02d|%d|", a.hour, a.minute, a.enabled ? 1 : 0);
+        al += b + a.label + L"\n";
+    }
+    SaveValue(L"alarms", al);
 }
 
 static void LoadUiValues() {
@@ -3278,6 +4118,23 @@ static void LoadUiValues() {
         U.note.push_back(notes.substr(s, e == wstring::npos ? wstring::npos : e - s));
         if (e == wstring::npos) break;
         s = e + 1;
+    }
+    wstring al = LoadValue(L"alarms");
+    for (size_t a = 0; a < al.size();) {
+        size_t e = al.find(L'\n', a);
+        wstring line = al.substr(a, e == wstring::npos ? wstring::npos : e - a);
+        int hh = -1, mm = -1, on = 1;
+        if (swscanf_s(line.c_str(), L"%d:%d|%d|", &hh, &mm, &on) == 3 && hh >= 0 && hh < 24 && mm >= 0 && mm < 60) {
+            AlarmCfg c;
+            c.hour = hh;
+            c.minute = mm;
+            c.enabled = on != 0;
+            size_t bar = line.find(L'|', line.find(L'|') + 1);
+            c.label = bar != wstring::npos ? line.substr(bar + 1) : L"Alarm";
+            U.alarms.push_back(c);
+        }
+        if (e == wstring::npos) break;
+        a = e + 1;
     }
     wstring shelf = LoadValue(L"shelf");
     s = 0;
@@ -3332,8 +4189,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, hwnd, 0};
             TrackMouseEvent(&tme);
             if (wp & MK_LBUTTON) {
-                if (g_dragAct == A_M_SEEKBAR) SeekFromX(p.x, g_dragRect);
-                else if (g_dragAct == A_LEVEL) LevelFromX(p.x, g_dragRect, g_dragArg);
+                if (g_noteDrag) {  // drag to select (scrolls when you pull past the edge)
+                    if (p.y < g_noteArea.top + 4) U.noteScroll -= 6;
+                    if (p.y > g_noteArea.bottom - 4) U.noteScroll += 6;
+                    SetCaret(NotePosAt(p, g_noteArea), true);
+                    Wake();
+                } else if (g_dragAct == A_M_SEEKBAR) SeekFromX(p.x, g_dragRect, false);
                 else if (g_shelfPress >= 0) {
                     POINT cur{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
                     if (std::abs(cur.x - g_pressPt.x) + std::abs(cur.y - g_pressPt.y) > 6) {
@@ -3352,13 +4213,28 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             U.mouse = {-1, -1};
             Wake();
             return 0;
-        case WM_LBUTTONDOWN: {
+        case WM_LBUTTONDOWN:
+        case WM_LBUTTONDBLCLK: {
             D2D1_POINT_2F p = ClientToCanvas(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
             const Hit* h = HitAt(p);
             g_dragAct = A_NONE;
             g_shelfPress = -1;
-            if (h && (h->act == A_M_SEEKBAR || h->act == A_LEVEL)) {
+            if (h && h->act == A_NT_AREA && U.expanded && U.tab == T_NOTES) {
+                U.noteFocus = true;
+                g_noteArea = h->r;
+                if (msg == WM_LBUTTONDBLCLK) NoteSelectWord(p, h->r);
+                else NoteClick(p, h->r);
+                U.prefCol = -1;
+                g_noteDrag = msg != WM_LBUTTONDBLCLK;
+                SetCapture(hwnd);
+                SetForegroundWindow(hwnd);
+                SetFocus(hwnd);
+                Wake();
+                return 0;
+            }
+            if (h && h->act == A_M_SEEKBAR) {
                 g_dragAct = h->act;
+                SeekFromX(p.x, h->r, false);
                 g_dragArg = h->arg;
                 g_dragRect = h->r;
                 SetCapture(hwnd);
@@ -3370,13 +4246,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_LBUTTONUP: {
+            if (g_noteDrag || (GetCapture() == hwnd && U.noteFocus && g_dragAct == A_NONE && g_shelfPress < 0)) {
+                g_noteDrag = false;
+                if (GetCapture() == hwnd) ReleaseCapture();
+                return 0;
+            }
             bool wasDrag = g_dragAct != A_NONE;
             bool shelfPressed = g_shelfPress >= 0;
             g_dragAct = A_NONE;
             g_shelfPress = -1;
             if (GetCapture() == hwnd) ReleaseCapture();
             D2D1_POINT_2F p = ClientToCanvas(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
-            if (wasDrag) { if (const Hit* h = HitAt(p)) if (h->act == A_M_SEEKBAR || h->act == A_LEVEL) DoAction(*h, p); return 0; }
+            if (wasDrag) { SeekFromX(p.x, g_dragRect); return 0; }  // one seek, where the bar was let go
             (void)shelfPressed;
             if (InIsland(p) || HitAt(p)) OnLeftClick(p);
             return 0;
@@ -3392,24 +4273,55 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_KEYDOWN:
         case WM_SYSKEYDOWN:
+            if (U.timerEdit && U.expanded && U.tab == T_CLOCK) {
+                if (wp == VK_BACK && !U.timerBuf.empty()) U.timerBuf.pop_back();
+                else if (wp == VK_RETURN) ApplyTimerEdit(true);
+                else if (wp == VK_ESCAPE) { U.timerEdit = false; U.timerBuf.clear(); }
+                Wake();
+                return 0;
+            }
+            if (U.alarmEdit && U.expanded && U.tab == T_CLOCK) {
+                if (wp == VK_BACK && !U.alarmBuf.empty()) U.alarmBuf.pop_back();
+                else if (wp == VK_RETURN) AddAlarm();
+                else if (wp == VK_ESCAPE) { U.alarmEdit = false; U.alarmBuf.clear(); }
+                Wake();
+                return 0;
+            }
             if (U.noteFocus && U.expanded && U.tab == T_NOTES) { NoteKey(wp); return 0; }
             break;
         case WM_CHAR:
+            if (U.alarmEdit && U.expanded && U.tab == T_CLOCK) {
+                if (wp >= L'0' && wp <= L'9' && U.alarmBuf.size() < 4) U.alarmBuf += (wchar_t)wp;
+                Wake();
+                return 0;
+            }
+            if (U.timerEdit && U.expanded && U.tab == T_CLOCK) {
+                if (wp >= L'0' && wp <= L'9' && U.timerBuf.size() < 5 && !(U.timerBuf.empty() && wp == L'0')) U.timerBuf += (wchar_t)wp;
+                Wake();
+                return 0;
+            }
             if (U.noteFocus && U.expanded && U.tab == T_NOTES) {
-                if (wp == L'\r') NoteInsertText(L"\n");
-                else if (wp >= 32) NoteInsertText(wstring(1, (wchar_t)wp));
+                bool ctrlDown = GetKeyState(VK_CONTROL) < 0;
+                if (wp == L'\r') { PushUndo(0); NoteInsertText(L"\n"); }
+                else if (wp == L'\t') { PushUndo(1); NoteInsertText(L"\t"); }
+                else if (wp >= 32 && wp != 127 && !(ctrlDown && GetKeyState(VK_MENU) >= 0)) {
+                    PushUndo(wp == L' ' ? 0 : 1);  // a space ends an undo step, like most editors
+                    NoteInsertText(wstring(1, (wchar_t)wp));
+                }
                 return 0;
             }
             break;
         case WM_KILLFOCUS:
             if (U.noteFocus) { U.noteFocus = false; SaveUiValues(); Wake(); }
+            if (U.timerEdit) { ApplyTimerEdit(false); Wake(); }
+            if (U.alarmEdit) { ApplyAlarmEdit(); Wake(); }
             return 0;
         case WM_HOTKEY:
             g_now = NowMs();
             if (U.fullscreen || U.auth) return 0;
             if (wp == HK_CYCLE) {  // closed -> half -> full -> closed (half skipped when empty)
                 if (U.expanded) CloseAll();
-                else if (U.halfOn || !HalfHasContent()) { U.halfOn = false; U.expanded = true; U.levelUntil = 0; }
+                else if (U.halfOn || !HalfHasContent()) { U.halfOn = false; U.expanded = true; }
                 else U.halfOn = true;
             } else if (wp == HK_LOCK) {
                 U.seeLock = !U.seeLock;
@@ -3423,8 +4335,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_ISLAND_ESC:
             if (U.expanded || U.halfOn) CloseAll();
             return 0;
-        case WM_ISLAND_CLICKOFF:
-            if ((U.expanded || U.halfOn) && !U.pinned && !Ghosted()) CloseAll();
+        case WM_ISLAND_CLICKOFF:  // a click outside the unpinned full view closes the island completely
+            if (U.expanded && !U.pinned && !Ghosted()) CloseAll();
             return 0;
         case WM_ISLAND_NOTIF: {
             std::deque<Notif> got;
@@ -3436,29 +4348,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_ISLAND_MEDIA: Wake(); return 0;
-        case WM_ISLAND_LEVEL: {
-            g_now = NowMs();
-            if (wp == 0) { U.vol = LOWORD(lp); U.muted = (lp >> 16) & 1; }
-            else U.bri = (int)lp;
-            if (!g_set.levelPopup) return 0;
-            if (U.levelKind != (int)wp) U.levelV.v = wp == 0 ? U.vol : U.bri;
-            U.levelKind = (int)wp;
-            if (U.expanded) U.inlineUntil = g_now + 1600;
-            else U.levelUntil = g_now + 1600;
-            Wake();
-            return 0;
-        }
-        case WM_ISLAND_REBIND:
-            BindVolume();
-            U.vol = GetVolume(&U.muted);
-            return 0;
-        case WM_ISLAND_SETTINGS:
+        case WM_ISLAND_SETTINGS: {
+            bool hadBanners = g_set.hideBanners;
             LoadSettings();
-            U.alarmOn.resize(g_set.alarms.size());
-            for (size_t i = 0; i < g_set.alarms.size(); i++) U.alarmOn[i] = g_set.alarms[i].enabled;
+            if (g_set.hideBanners && !hadBanners) HideAllBanners();
+            else if (!g_set.hideBanners && hadBanners) RestoreBanners();
             RegisterHotkeys();
             Wake();
             return 0;
+        }
         case WM_CLIPBOARDUPDATE: OnClipboardUpdate(); return 0;
         case WM_DISPLAYCHANGE:
         case WM_DPICHANGED:
@@ -3475,7 +4373,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 // Threads and lifetime
 // ============================================================================
 
-static std::thread g_uiThread, g_notifThread, g_mediaThread, g_briThread;
+static std::thread g_uiThread, g_notifThread, g_mediaThread;
 
 static void UiThread() {
     using SetCtx_t = HANDLE(WINAPI*)(HANDLE);
@@ -3483,8 +4381,6 @@ static void UiThread() {
         setCtx((HANDLE)-4 /* DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 */);
     OleInitialize(nullptr);
     LoadUiValues();
-    U.alarmOn.resize(g_set.alarms.size());
-    for (size_t i = 0; i < g_set.alarms.size(); i++) U.alarmOn[i] = g_set.alarms[i].enabled;
     if (!InitGraphics()) {
         Wh_Log(L"Direct2D/DirectWrite failed to start");
         OleUninitialize();
@@ -3492,12 +4388,23 @@ static void UiThread() {
     }
     WNDCLASSEXW wc{sizeof(wc)};
     wc.lpfnWndProc = WndProc;
+    wc.style = CS_DBLCLKS;
     wc.hInstance = GetModuleHandleW(nullptr);
     wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512) /* IDC_ARROW */);
     wc.lpszClassName = L"IslandNotchWindow";
     RegisterClassExW(&wc);
-    g_hwnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE, wc.lpszClassName, L"Island", WS_POPUP, 0, 0, 10, 10,
-                             nullptr, nullptr, wc.hInstance, nullptr);
+    // Windows keeps Start, search and the notification centre in "bands" above every normal
+    // topmost window. Ask for a higher band first; Windows only grants that to some processes
+    // (e.g. ones with UI Access), so fall back to plain topmost if it says no.
+    using CreateWindowInBand_t = HWND(WINAPI*)(DWORD, LPCWSTR, LPCWSTR, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE, LPVOID, DWORD);
+    auto createInBand = (CreateWindowInBand_t)GetProcAddress(GetModuleHandleW(L"user32.dll"), "CreateWindowInBand");
+    const DWORD EX = WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE;
+    for (DWORD band : {16u /* system tools */, 2u /* UI access */, 7u /* edgy */}) {
+        if (!createInBand) break;
+        g_hwnd = createInBand(EX, wc.lpszClassName, L"Island", WS_POPUP, 0, 0, 10, 10, nullptr, nullptr, wc.hInstance, nullptr, band);
+        if (g_hwnd) { Wh_Log(L"Window band %u granted: above Start", band); break; }
+    }
+    if (!g_hwnd) g_hwnd = CreateWindowExW(EX, wc.lpszClassName, L"Island", WS_POPUP, 0, 0, 10, 10, nullptr, nullptr, wc.hInstance, nullptr);
     if (!g_hwnd) {
         Wh_Log(L"CreateWindowEx failed: %u", GetLastError());
         ShutdownGraphics();
@@ -3507,9 +4414,9 @@ static void UiThread() {
     U.w.v = 90;
     Reposition();
     ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
-    BindVolume();
-    U.vol = GetVolume(&U.muted);
-    U.levelV.v = U.vol;
+    U.dlFolder = DownloadsFolder();
+    U.micMuted = MicMuted();
+    if (g_set.hideBanners) HideAllBanners();
     g_drop = new DropTarget();
     RegisterDragDrop(g_hwnd, g_drop);
     AddClipboardFormatListener(g_hwnd);
@@ -3522,7 +4429,6 @@ static void UiThread() {
     g_mediaWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g_notifThread = std::thread(NotificationThread);
     g_mediaThread = std::thread(MediaThread);
-    g_briThread = std::thread(BrightnessThread);
     Wake();
 
     MSG msg;
@@ -3537,11 +4443,10 @@ static void UiThread() {
     if (g_kbHook) UnhookWindowsHookEx(g_kbHook);
     if (g_mouseHook) UnhookWindowsHookEx(g_mouseHook);
     if (g_winEvHook) UnhookWinEvent(g_winEvHook);
-    ShutdownVolume();
+    if (g_set.hideBanners) RestoreBanners();  // Windows' own pop-ups come back when the island stops
     g_hwnd = nullptr;
     if (g_notifThread.joinable()) g_notifThread.join();
     if (g_mediaThread.joinable()) g_mediaThread.join();
-    if (g_briThread.joinable()) g_briThread.join();
     if (g_drop) { g_drop->Release(); g_drop = nullptr; }
     ShutdownGraphics();
     OleUninitialize();
